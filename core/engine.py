@@ -10,8 +10,6 @@ from core.market import (
     is_gold,
 )
 from core.learning import get_learning_boost
-from core.news import fetch_news
-from core.signals import build_news_signals
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
@@ -25,7 +23,6 @@ def pct(x: float) -> str:
 
 def price_fmt(p: float) -> str:
     try:
-        p = float(p)
         if p >= 1000:
             return f"${p:,.0f}"
         if p >= 1:
@@ -39,7 +36,6 @@ def price_fmt(p: float) -> str:
 
 def money(x: float) -> str:
     try:
-        x = float(x)
         if x >= 1_000_000_000_000:
             return f"${x/1_000_000_000_000:.2f}T"
         if x >= 1_000_000_000:
@@ -66,43 +62,85 @@ def detect_mode(text: str) -> str:
 
 def parse_top_n(text: str, default: int = 20) -> int:
     t = (text or "").lower()
+    if "top " in t:
+        # top 20 / top 30 etc
+        try:
+            after = t.split("top ", 1)[1].strip()
+            n = int(after.split()[0])
+            return max(5, min(50, n))
+        except Exception:
+            pass
+
+    # si escribió un número suelto, lo tomamos como top_n (con límites)
     for tok in t.replace(",", " ").split():
         if tok.isdigit():
             n = int(tok)
-            return max(10, min(50, n))
-    if "top 10" in t:
-        return 10
-    if "top 20" in t:
-        return 20
+            return max(5, min(50, n))
+
     return default
 
 
-def extract_symbol(text: str) -> Optional[str]:
-    if not text:
-        return None
-    tokens = text.replace(",", " ").replace("?", " ").replace("!", " ").split()
-    stop = {"HOLA", "HOY", "INFO", "TOP", "DAME", "QUIERO", "RIESGO", "SEMANAL", "DIARIO", "MENSUAL", "INFORME"}
-    for tok in tokens:
-        up = tok.upper().strip()
-        if 2 <= len(up) <= 6 and up.isalpha() and up not in stop:
-            return up
+def detect_risk_pref(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    if any(k in t for k in ["bajo", "conserv", "low"]):
+        return "LOW"
+    if any(k in t for k in ["medio", "medium"]):
+        return "MEDIUM"
+    if any(k in t for k in ["alto", "agres", "high"]):
+        return "HIGH"
     return None
 
 
-def _exclude_weird_assets(row: Dict) -> bool:
-    # Filtra “fondos tokenizados” y cosas no-crypto típicas que CoinGecko a veces mete en top 100
-    name = (row.get("name") or "").lower()
-    sym = (row.get("symbol") or "").upper()
+def _tokenize(text: str) -> List[str]:
+    if not text:
+        return []
+    return (
+        text.replace(",", " ")
+        .replace("?", " ")
+        .replace("!", " ")
+        .replace(":", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+        .replace("/", " ")
+        .replace("\\", " ")
+        .split()
+    )
 
-    bad_words = [
-        "treasury", "fund", "money market", "clo", "gov", "government", "bond",
-        "helic", "heloc", "janus", "superstate", "anemoy", "figure",
-    ]
-    if any(w in name for w in bad_words):
-        return True
-    if sym.endswith("B") and "bond" in name:
-        return True
-    return False
+
+def extract_symbol(text: str) -> Optional[str]:
+    """
+    FIX: evita tomar palabras del contexto (PEDIDO/CONTEXTO/etc) como si fueran tickers.
+    Regla: solo 2-6 letras, alpha, y NO en blacklist. Para >=5 letras exigimos que parezca ticker real.
+    """
+    BLOCKED = {
+        "HOLA", "HOY", "INFO", "TOP", "DAME", "QUIERO", "RIESGO",
+        "SEMANAL", "DIARIO", "MENSUAL",
+        "PEDIDO", "ACTUAL", "CONTEXTO", "PARAMETROS", "PARAMETROS", "PARAMS",
+        "MODE", "FOCUS", "AVOID", "PREFIERO", "EVITA", "INFORME"
+    }
+
+    # allowlist chica para tickers de 5 letras que suelen existir y la gente pregunta
+    ALLOW_5PLUS = {"USDT", "USDC", "DAI", "PAXG", "XAUT"}  # igual luego se filtran stables/oro
+
+    for tok in _tokenize(text):
+        up = tok.upper().strip()
+
+        if not up.isalpha():
+            continue
+
+        if up in BLOCKED:
+            continue
+
+        if len(up) < 2 or len(up) > 6:
+            continue
+
+        # Para 5-6 letras: solo si está en allowlist (reduce falsos positivos tipo PEDIDO)
+        if len(up) >= 5 and up not in ALLOW_5PLUS:
+            continue
+
+        return up
+
+    return None
 
 
 def compute_engine_score(row: Dict) -> float:
@@ -138,7 +176,6 @@ def compute_engine_score(row: Dict) -> float:
 
 
 def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
-    # 35% majors, 65% alts (mínimos razonables)
     m_target = max(4, min(10, round(total * 0.35)))
     a_target = total - m_target
 
@@ -156,30 +193,62 @@ def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
     return majors_sel, alts_sel
 
 
-def fallback_compact(mode: str, top_n: int, majors: List[Dict], alts: List[Dict], signals: Dict) -> str:
-    # Compacto y entendible: 4-6 líneas + lista corta
+def raw_report(mode: str, top_n: int, majors: List[Dict], alts: List[Dict]) -> str:
     lines = []
     lines.append(f"Panorama {mode} | Top {top_n}")
-    if signals.get("n_items", 0) > 0:
-        tags = signals.get("tag_counts", {})
-        top_syms = signals.get("top_symbols", [])
-        if tags:
-            top_tags = ", ".join(sorted(tags.keys(), key=lambda k: tags[k], reverse=True)[:4])
-            lines.append(f"Señales news: {top_tags}")
-        if top_syms:
-            lines.append(f"Tokens mencionados en news: {', '.join(top_syms[:6])}")
+    lines.append("")
+
+    lines.append("NO-ALTS")
+    if not majors:
+        lines.append("(sin resultados en NO-ALTS con los filtros actuales)")
+    else:
+        for i, r in enumerate(majors, 1):
+            lines.append(
+                f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
+                f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
+                f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
+            )
 
     lines.append("")
-    lines.append("NO-ALTS (selección)")
-    for r in majors[:6]:
-        lines.append(f"- {r['symbol']} score {r['engine_score']:.1f} | 7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | {price_fmt(r['price'])}")
-
-    lines.append("")
-    lines.append("ALTS (selección)")
-    for r in alts[:10]:
-        lines.append(f"- {r['symbol']} score {r['engine_score']:.1f} | 7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | {price_fmt(r['price'])}")
+    lines.append("ALTS")
+    if not alts:
+        lines.append("(sin resultados en ALTS con los filtros actuales)")
+    else:
+        for i, r in enumerate(alts, 1):
+            lines.append(
+                f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
+                f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
+                f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
+            )
 
     return "\n".join(lines)
+
+
+def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], alts: List[Dict]) -> str:
+    def compact(items):
+        out = []
+        for r in items:
+            out.append({
+                "symbol": r["symbol"],
+                "name": r["name"],
+                "score": round(float(r["engine_score"]), 1),
+                "risk": r["risk"],
+                "mom7": round(float(r["mom_7d"]), 2),
+                "mom30": round(float(r["mom_30d"]), 2),
+                "price": float(r["price"]),
+                "mcap": float(r["market_cap"]),
+                "vol24h": float(r["volume_24h"]),
+            })
+        return out
+
+    payload = {
+        "mode": mode,
+        "risk_pref": risk_pref,
+        "no_alts": compact(majors),
+        "alts": compact(alts),
+        "rules": {"use_only_payload": True},
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def llm_render(user_text: str, payload_json: str, fallback_text: str) -> str:
@@ -193,20 +262,21 @@ def llm_render(user_text: str, payload_json: str, fallback_text: str) -> str:
         return fallback_text
 
     system = (
-        "Sos un analista cripto prudente. Español rioplatense, claro y conversacional. "
+        "Sos un analista cripto prudente. Escribís en español rioplatense, claro y conversacional. "
         "No das asesoramiento financiero. "
-        "No pegues listados largos. No muestres titulares. "
-        "REGLA: solo podés usar datos del JSON; no inventes."
+        "No incluyas titulares, RSS, ni notas largas. "
+        "REGLA: solo podés usar datos dentro del JSON. No inventes."
     )
 
     user = (
         f"Usuario dijo: {user_text}\n\n"
         f"JSON (fuente única):\n{payload_json}\n\n"
-        "Respondé así:\n"
-        "1) Panorama en 2-3 líneas.\n"
-        "2) 6 a 10 ideas concretas (mezclá NO-ALTS y ALTS): por qué entra, riesgo, y qué invalida.\n"
-        "3) Si el usuario pidió diario/semanal/mensual, adaptá el horizonte.\n"
-        "4) Usá news_signals SOLO como contexto (tags y tokens mencionados), sin titulares.\n"
+        "Respondé:\n"
+        "- 2-3 líneas de panorama.\n"
+        "- 4 a 8 ideas concretas (mezclá no-alts y alts): por qué entra, riesgo, y qué invalida.\n"
+        "- Si el usuario pidió 'top N', podés listar como máximo 12 items, no más.\n"
+        "- Si falta info, hacé 1 pregunta corta.\n"
+        "- No pegues el listado entero del fallback.\n"
     )
 
     try:
@@ -224,19 +294,13 @@ def llm_render(user_text: str, payload_json: str, fallback_text: str) -> str:
 def build_engine_analysis(user_text: str) -> str:
     mode = detect_mode(user_text)
     top_n = parse_top_n(user_text, default=20)
+    risk_pref = detect_risk_pref(user_text)
     symbol = extract_symbol(user_text)
 
-    # Market
     rows = fetch_top100_market()
 
-    # Filtros clave
-    rows = [
-        r for r in rows
-        if r.get("symbol")
-        and (not is_stable(r))
-        and (not is_gold(r))
-        and (not _exclude_weird_assets(r))
-    ]
+    # FILTROS CLAVE: afuera stables y oro
+    rows = [r for r in rows if r.get("symbol") and (not is_stable(r)) and (not is_gold(r))]
 
     enriched = []
     for r in rows:
@@ -247,8 +311,8 @@ def build_engine_analysis(user_text: str) -> str:
 
     enriched.sort(key=lambda x: x["engine_score"], reverse=True)
 
-    # Ficha por símbolo si preguntan por una moneda
-    if symbol and any(k in (user_text or "").lower() for k in ["?", "como", "ves", "hoy", "seman", "mes", "diario", "mensual"]):
+    # Si preguntó por símbolo, devolvemos ficha corta (sin confundirse con "PEDIDO", etc.)
+    if symbol and any(k in (user_text or "").lower() for k in ["?", "como", "ves", "hoy", "seman", "mes", "diar"]):
         r = next((x for x in enriched if x["symbol"] == symbol), None)
         if not r:
             return f"No encontré {symbol} en el top 100 actual."
@@ -263,40 +327,7 @@ def build_engine_analysis(user_text: str) -> str:
     majors, alts = split_alts_and_majors(top)
     majors, alts = pick_balanced(majors, alts, top_n)
 
-    # News signals (sin titulares)
-    news = fetch_news(limit_total=40)
-    signals = build_news_signals(news, max_items=8)
+    fallback = raw_report(mode, top_n, majors, alts)
+    payload = raw_compact_json(mode, risk_pref, majors, alts)
 
-    payload = {
-        "mode": mode,
-        "no_alts": [
-            {
-                "symbol": r["symbol"], "name": r["name"],
-                "score": round(float(r["engine_score"]), 1),
-                "risk": r["risk"],
-                "mom7": round(float(r["mom_7d"]), 2),
-                "mom30": round(float(r["mom_30d"]), 2),
-                "price": float(r["price"]),
-                "mcap": float(r["market_cap"]),
-                "vol24h": float(r["volume_24h"]),
-            } for r in majors
-        ],
-        "alts": [
-            {
-                "symbol": r["symbol"], "name": r["name"],
-                "score": round(float(r["engine_score"]), 1),
-                "risk": r["risk"],
-                "mom7": round(float(r["mom_7d"]), 2),
-                "mom30": round(float(r["mom_30d"]), 2),
-                "price": float(r["price"]),
-                "mcap": float(r["market_cap"]),
-                "vol24h": float(r["volume_24h"]),
-            } for r in alts
-        ],
-        "news_signals": signals,
-        "rules": {"use_only_payload": True},
-    }
-
-    payload_json = json.dumps(payload, ensure_ascii=False)
-    fallback = fallback_compact(mode, top_n, majors, alts, signals)
-    return llm_render(user_text, payload_json, fallback)
+    return llm_render(user_text, payload, fallback)
