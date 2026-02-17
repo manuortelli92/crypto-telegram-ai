@@ -14,12 +14,13 @@ from core.learning import get_learning_boost
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 
+# --------------------- FORMATO ---------------------
+
 def pct(x: float) -> str:
     try:
         return f"{float(x):+.2f}%"
     except Exception:
         return "n/a"
-
 
 def price_fmt(p: float) -> str:
     try:
@@ -33,7 +34,6 @@ def price_fmt(p: float) -> str:
         return f"${p:.6f}"
     except Exception:
         return "n/a"
-
 
 def money(x: float) -> str:
     try:
@@ -51,6 +51,8 @@ def money(x: float) -> str:
         return "n/a"
 
 
+# --------------------- PARSE ---------------------
+
 def detect_mode(text: str) -> str:
     t = (text or "").lower()
     if "mensual" in t or "mes" in t:
@@ -60,7 +62,6 @@ def detect_mode(text: str) -> str:
     if "semanal" in t or "semana" in t or "7d" in t:
         return "SEMANAL"
     return "SEMANAL"
-
 
 def parse_top_n(text: str, default: int = 20) -> int:
     t = (text or "").lower()
@@ -74,7 +75,6 @@ def parse_top_n(text: str, default: int = 20) -> int:
         return 20
     return default
 
-
 def detect_risk_pref(text: str) -> Optional[str]:
     t = (text or "").lower()
     if any(k in t for k in ["bajo", "conserv", "low"]):
@@ -84,7 +84,6 @@ def detect_risk_pref(text: str) -> Optional[str]:
     if any(k in t for k in ["alto", "agres", "high"]):
         return "HIGH"
     return None
-
 
 def extract_symbol(text: str) -> Optional[str]:
     if not text:
@@ -97,6 +96,25 @@ def extract_symbol(text: str) -> Optional[str]:
             return up
     return None
 
+
+# --------------------- FILTROS EXTRA (RWA/FUNDS) ---------------------
+
+FUND_WORDS = [
+    "treasury", "fund", "anemoy", "superstate", "government securities", "clo", "t-bill", "bill",
+    "janus henderson", "short duration", "ustb"
+]
+
+def is_fund_like(row: Dict) -> bool:
+    name = (row.get("name") or "").lower()
+    sym = (row.get("symbol") or "").lower()
+    if any(w in name for w in FUND_WORDS):
+        return True
+    if any(w in sym for w in ["jtrsy", "jaaa", "ustb"]):
+        return True
+    return False
+
+
+# --------------------- SCORE ---------------------
 
 def compute_engine_score(row: Dict) -> float:
     mom7 = float(row.get("mom_7d", 0) or 0)
@@ -130,29 +148,28 @@ def compute_engine_score(row: Dict) -> float:
     return base + consistency + dd_penalty + liq + learn
 
 
-def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
-    # objetivo: SIEMPRE tener NO-ALTS visible
-    m_target = max(4, min(10, round(total * 0.35)))
+# --------------------- SELECCIÓN BALANCEADA REAL ---------------------
+
+def pick_balanced_ranked(majors_ranked: List[Dict], alts_ranked: List[Dict], total: int):
+    m_target = max(5, min(10, round(total * 0.40)))  # un poco más de majors
     a_target = total - m_target
 
-    majors_sel = majors[:m_target]
-    alts_sel = alts[:a_target]
+    majors_sel = majors_ranked[:m_target]
+    alts_sel = alts_ranked[:a_target]
 
-    # fallback si falta alguno
+    # completar si falta alguno
     if len(majors_sel) < m_target:
         need = m_target - len(majors_sel)
-        alts_sel = (alts_sel + alts[a_target:a_target + need])[:total]
+        alts_sel = (alts_sel + alts_ranked[a_target:a_target + need])[:total]
 
     if len(alts_sel) < a_target:
         need = a_target - len(alts_sel)
-        majors_sel = (majors_sel + majors[m_target:m_target + need])[:total]
-
-    # última red de seguridad: si NO-ALTS quedó vacío, robamos del top global
-    if not majors_sel and majors:
-        majors_sel = majors[:max(1, min(5, len(majors)))]
+        majors_sel = (majors_sel + majors_ranked[m_target:m_target + need])[:total]
 
     return majors_sel, alts_sel
 
+
+# --------------------- OUTPUT ---------------------
 
 def raw_report(mode: str, top_n: int, majors: List[Dict], alts: List[Dict]) -> str:
     lines = []
@@ -160,27 +177,21 @@ def raw_report(mode: str, top_n: int, majors: List[Dict], alts: List[Dict]) -> s
 
     lines.append("")
     lines.append("NO-ALTS")
-    if not majors:
-        lines.append("(sin resultados en NO-ALTS con los filtros actuales)")
-    else:
-        for i, r in enumerate(majors, 1):
-            lines.append(
-                f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
-                f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
-                f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
-            )
+    for i, r in enumerate(majors, 1):
+        lines.append(
+            f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
+            f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
+            f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
+        )
 
     lines.append("")
     lines.append("ALTS")
-    if not alts:
-        lines.append("(sin resultados en ALTS con los filtros actuales)")
-    else:
-        for i, r in enumerate(alts, 1):
-            lines.append(
-                f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
-                f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
-                f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
-            )
+    for i, r in enumerate(alts, 1):
+        lines.append(
+            f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
+            f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
+            f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
+        )
 
     return "\n".join(lines)
 
@@ -258,10 +269,10 @@ def build_engine_analysis(user_text: str) -> str:
 
     rows = fetch_top100_market()
 
-    # filtros: afuera stables y oro
+    # filtros: stables, oro, y funds/treasuries tokenizados
     rows = [
         r for r in rows
-        if r.get("symbol") and (not is_stable(r)) and (not is_gold(r))
+        if r.get("symbol") and (not is_stable(r)) and (not is_gold(r)) and (not is_fund_like(r))
     ]
 
     enriched = []
@@ -271,9 +282,7 @@ def build_engine_analysis(user_text: str) -> str:
         rr["risk"] = estimate_risk(rr)
         enriched.append(rr)
 
-    enriched.sort(key=lambda x: x["engine_score"], reverse=True)
-
-    # ficha corta solo si el mensaje es corto y no pide informe
+    # ficha corta: solo si mensaje corto y no pide informe
     t = (user_text or "").lower()
     if symbol and ("informe" not in t) and (len((user_text or "").split()) <= 6):
         r = next((x for x in enriched if x.get("symbol") == symbol), None)
@@ -286,11 +295,15 @@ def build_engine_analysis(user_text: str) -> str:
             f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
         )
 
-    top = enriched[:top_n]
-    majors, alts = split_alts_and_majors(top)
-    majors, alts = pick_balanced(majors, alts, top_n)
+    # Ranking separado: majors y alts (así NO-ALTS no depende del top score)
+    majors_all, alts_all = split_alts_and_majors(enriched)
 
-    fallback = raw_report(mode, top_n, majors, alts)
-    payload = raw_compact_json(mode, risk_pref, majors, alts)
+    majors_ranked = sorted(majors_all, key=lambda x: x["engine_score"], reverse=True)
+    alts_ranked = sorted(alts_all, key=lambda x: x["engine_score"], reverse=True)
+
+    majors_sel, alts_sel = pick_balanced_ranked(majors_ranked, alts_ranked, top_n)
+
+    fallback = raw_report(mode, top_n, majors_sel, alts_sel)
+    payload = raw_compact_json(mode, risk_pref, majors_sel, alts_sel)
 
     return llm_render(user_text, payload, fallback)
