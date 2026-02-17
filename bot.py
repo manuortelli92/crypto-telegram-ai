@@ -5,6 +5,7 @@ from collections import deque
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.error import Conflict, NetworkError, TimedOut
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from core.memory import load_state, set_chat_id
@@ -25,9 +26,11 @@ SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
 
 _user_hits = {}
 
+
 def is_owner(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
     return str(uid) == str(OWNER_ID)
+
 
 def rate_limit_ok(user_id: int) -> bool:
     now = time.time()
@@ -42,6 +45,7 @@ def rate_limit_ok(user_id: int) -> bool:
     q.append(now)
     return True
 
+
 async def send_weekly(application: Application):
     state = load_state()
     chat_id = state.get("chat_id")
@@ -52,6 +56,7 @@ async def send_weekly(application: Application):
         await application.bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
         logging.error("weekly send failed: %s", e)
+
 
 async def on_startup(app: Application):
     scheduler = AsyncIOScheduler()
@@ -65,6 +70,7 @@ async def on_startup(app: Application):
         replace_existing=True,
     )
     scheduler.start()
+
 
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -81,27 +87,23 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Demasiadas solicitudes. Espera 1 minuto.")
             return
 
-    # Aprende de lo que escriben (solo suma pesos, no responde)
+    # Aprende de lo que escriben
     register_user_interest(text)
 
     # /start como texto normal
     if text == "/start" or text.lower() in ["start", "hola", "buenas", "hey"]:
         await update.message.reply_text(
-            "Escribi por ejemplo:\n"
-            "informe diario\n"
-            "informe semanal\n"
-            "informe mensual\n"
-            "o preguntame por una moneda puntual."
+            "Escribi normal.\n"
+            "Ej: 'informe semanal', 'informe diario', 'informe mensual', 'BTC hoy?'\n"
         )
-        # Guardamos chat_id solo del owner para informes automáticos
         if is_owner(update):
             set_chat_id(int(chat.id))
         return
 
-    # Guardamos chat_id del owner si escribe (para el semanal)
     if is_owner(update):
         set_chat_id(int(chat.id))
 
+    # Respuesta
     await update.message.reply_text("Analizando...")
     try:
         reply = build_engine_analysis(text)
@@ -109,10 +111,35 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {type(e).__name__}: {e}")
 
-def main():
+
+def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
     app.add_handler(MessageHandler(filters.TEXT, chat_handler))
-    app.run_polling()
+    return app
+
+
+def main():
+    # Loop de resiliencia: si Telegram corta por Conflict o red, reintenta
+    while True:
+        try:
+            app = build_app()
+            # drop_pending_updates evita cola vieja si se reinicia
+            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+            return
+
+        except Conflict as e:
+            logging.error("Telegram Conflict (otra instancia usando getUpdates). %s", e)
+            # Esto NO se arregla con código: hay que dejar 1 sola instancia.
+            time.sleep(10)
+
+        except (TimedOut, NetworkError) as e:
+            logging.error("Error de red/timeout. Reintentando en 5s: %s", e)
+            time.sleep(5)
+
+        except Exception as e:
+            logging.error("Error inesperado. Reintentando en 10s: %s", e)
+            time.sleep(10)
+
 
 if __name__ == "__main__":
     main()
