@@ -9,11 +9,32 @@ COINBASE_TICKER = "https://api.exchange.coinbase.com/products/{product_id}/ticke
 KRAKEN_TICKER = "https://api.kraken.com/0/public/Ticker"
 
 DEFAULT_TIMEOUT = 20
-
 HEADERS = {"User-Agent": "OrtelliCryptoAI/1.0"}
 
-# Cache para evitar 429 en CoinGecko
-_COINGECKO_CACHE = {"ts": 0, "data": None}
+# TTLs (segundos). Subilos si querés menos requests aún.
+TTL_COINGECKO = 180
+TTL_BINANCE = 60
+TTL_COINBASE = 60
+TTL_KRAKEN = 60
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _cache_get(cache: dict, key: str, ttl: int):
+    now = _now()
+    item = cache.get(key)
+    if not item:
+        return None
+    ts, val = item
+    if now - ts < ttl:
+        return val
+    return None
+
+
+def _cache_set(cache: dict, key: str, val):
+    cache[key] = (_now(), val)
 
 
 def _get_json(url: str, params=None, headers=None, timeout: int = DEFAULT_TIMEOUT):
@@ -23,15 +44,28 @@ def _get_json(url: str, params=None, headers=None, timeout: int = DEFAULT_TIMEOU
     return r.json()
 
 
+# -------------------------
+# CACHES POR FUENTE
+# -------------------------
+_COINGECKO_CACHE: Dict[str, tuple] = {}
+_BINANCE_CACHE: Dict[str, tuple] = {}
+_COINBASE_CACHE: Dict[str, tuple] = {}
+_KRAKEN_CACHE: Dict[str, tuple] = {}
+
+
+# -------------------------
+# COINGECKO (Top 100)
+# -------------------------
 def fetch_coingecko_top100(vs: str = "usd") -> List[dict]:
     """
     Devuelve top 100 por market cap desde CoinGecko.
-    Cachea 120s para evitar rate limit (429).
+    Cachea para evitar 429.
     Si CoinGecko falla y hay cache, devuelve cache.
     """
-    now = time.time()
-    if _COINGECKO_CACHE["data"] and (now - _COINGECKO_CACHE["ts"] < 120):
-        return _COINGECKO_CACHE["data"]
+    key = f"top100:{vs}"
+    cached = _cache_get(_COINGECKO_CACHE, key, TTL_COINGECKO)
+    if cached is not None:
+        return cached
 
     params = {
         "vs_currency": vs,
@@ -45,8 +79,9 @@ def fetch_coingecko_top100(vs: str = "usd") -> List[dict]:
     try:
         data = _get_json(COINGECKO_MARKETS, params=params)
     except Exception:
-        if _COINGECKO_CACHE["data"]:
-            return _COINGECKO_CACHE["data"]
+        # fallback si rate limit / caída
+        if (key in _COINGECKO_CACHE) and (_COINGECKO_CACHE[key][1] is not None):
+            return _COINGECKO_CACHE[key][1]
         raise
 
     rows = []
@@ -63,16 +98,33 @@ def fetch_coingecko_top100(vs: str = "usd") -> List[dict]:
             "mom_30d": float(coin.get("price_change_percentage_30d_in_currency", 0) or 0),
         })
 
-    _COINGECKO_CACHE["data"] = rows
-    _COINGECKO_CACHE["ts"] = now
+    _cache_set(_COINGECKO_CACHE, key, rows)
     return rows
 
 
+# -------------------------
+# BINANCE (Ticker price)
+# -------------------------
 def binance_prices_usdt() -> Dict[str, float]:
     """
     Devuelve dict {"BTCUSDT": 67000.0, ...}
+    Binance puede devolver 451 (bloqueo por región/IP).
+    Cachea y si falla devuelve {} sin romper nada.
     """
-    data = _get_json(BINANCE_TICKER)
+    key = "ticker:usdt"
+    cached = _cache_get(_BINANCE_CACHE, key, TTL_BINANCE)
+    if cached is not None:
+        return cached
+
+    try:
+        data = _get_json(BINANCE_TICKER)
+    except Exception:
+        # fallback: si hay cache viejo, devolvelo; si no, {}
+        old = _BINANCE_CACHE.get(key)
+        if old and old[1] is not None:
+            return old[1]
+        return {}
+
     out: Dict[str, float] = {}
     for it in data:
         sym = it.get("symbol")
@@ -82,27 +134,60 @@ def binance_prices_usdt() -> Dict[str, float]:
                 out[sym] = float(price)
             except Exception:
                 pass
+
+    _cache_set(_BINANCE_CACHE, key, out)
     return out
 
 
+# -------------------------
+# COINBASE (Ticker por símbolo)
+# -------------------------
 def coinbase_price_usd(symbol: str) -> Optional[float]:
     """
     Coinbase spot ticker para SYMBOL-USD.
+    Cachea por símbolo para evitar rate limits.
     """
-    product_id = f"{symbol}-USD"
-    url = COINBASE_TICKER.format(product_id=product_id)
+    symbol = (symbol or "").upper().strip()
+    if not symbol:
+        return None
+
+    key = f"{symbol}-USD"
+    cached = _cache_get(_COINBASE_CACHE, key, TTL_COINBASE)
+    if cached is not None:
+        return cached
+
+    url = COINBASE_TICKER.format(product_id=key)
     try:
         data = _get_json(url)
         p = data.get("price")
-        return float(p) if p is not None else None
+        val = float(p) if p is not None else None
+        _cache_set(_COINBASE_CACHE, key, val)
+        return val
     except Exception:
+        # fallback a cache viejo si existía
+        old = _COINBASE_CACHE.get(key)
+        if old and old[1] is not None:
+            return old[1]
         return None
 
 
+# -------------------------
+# KRAKEN (Ticker por símbolo)
+# -------------------------
 def kraken_price_usd(symbol: str) -> Optional[float]:
     """
     Kraken ticker: intentamos varias variantes.
+    Cachea por símbolo.
     """
+    symbol = (symbol or "").upper().strip()
+    if not symbol:
+        return None
+
+    key = f"{symbol}-USD"
+    cached = _cache_get(_KRAKEN_CACHE, key, TTL_KRAKEN)
+    if cached is not None:
+        return cached
+
     pairs_try = [f"{symbol}USD"]
 
     if symbol == "BTC":
@@ -130,12 +215,22 @@ def kraken_price_usd(symbol: str) -> Optional[float]:
             ticker = result[k]
             c = ticker.get("c")
             if c and len(c) > 0:
-                return float(c[0])
+                val = float(c[0])
+                _cache_set(_KRAKEN_CACHE, key, val)
+                return val
         except Exception:
             continue
+
+    # fallback a cache viejo si existía
+    old = _KRAKEN_CACHE.get(key)
+    if old and old[1] is not None:
+        return old[1]
     return None
 
 
+# -------------------------
+# Utils
+# -------------------------
 def median(values: List[float]) -> Optional[float]:
     vs = sorted([v for v in values if v is not None])
     if not vs:
@@ -147,10 +242,12 @@ def median(values: List[float]) -> Optional[float]:
     return (vs[mid - 1] + vs[mid]) / 2.0
 
 
+# -------------------------
+# Verificación Multi-fuente
+# -------------------------
 def verify_prices(
     rows: List[dict],
     verify_threshold_pct: float = 2.0,
-    sleep_coinbase_sec: float = 0.12,
 ) -> Tuple[List[dict], dict]:
     """
     Enriquecemos cada row con:
@@ -179,23 +276,22 @@ def verify_prices(
 
         sources: Dict[str, float] = {}
 
-        # Binance USDT
+        # Binance USDT (si está disponible)
         bkey = f"{sym}USDT"
         if bkey in bn:
             sources["binance"] = bn[bkey]
 
-        # Coinbase USD (rate limit suave)
+        # Coinbase USD (cacheado)
         cb = coinbase_price_usd(sym)
         if cb is not None:
             sources["coinbase"] = cb
-        time.sleep(sleep_coinbase_sec)
 
-        # Kraken USD (best effort)
+        # Kraken USD (cacheado)
         kk = kraken_price_usd(sym)
         if kk is not None:
             sources["kraken"] = kk
 
-        # CoinGecko (ya viene en r["price"]) como fuente también
+        # CoinGecko (ya viene en r["price"]) también cuenta como fuente
         cg_price = r.get("price")
         if cg_price is not None and float(cg_price) > 0:
             sources["coingecko"] = float(cg_price)
