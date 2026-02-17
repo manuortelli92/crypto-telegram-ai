@@ -74,10 +74,13 @@ def build_ai_brief(prefs: Dict, user_message: str = "") -> str:
         return structured
 
     system = (
-        "Sos un analista crypto prudente. "
-        "Das opciones y planes, no ordenes. "
-        "Siempre explicas riesgo y supuestos. "
-        "No inventes datos; usa SOLO lo que te doy."
+       system = (
+    "Sos un analista crypto profesional que habla siempre en ESPANOL. "
+    "Nunca respondas en ingles. "
+    "Das opciones y escenarios, no ordenes ni promesas. "
+    "Tu estilo es claro, humano y directo. "
+    "Explicas riesgo primero y evitas hype."
+)
     )
     user = (
         "Transforma este brief estructurado (con datos verificados multi-fuente) en un mensaje mas humano en espanol con:\n"
