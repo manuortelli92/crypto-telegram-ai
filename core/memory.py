@@ -1,36 +1,85 @@
 import json
 import os
+from typing import Dict, Any, Optional
 
-STATE_FILE = "bot_state.json"
+STATE_PATH = os.getenv("STATE_PATH", "core/state.json")
 
-def load_state():
 
-    if not os.path.exists(STATE_FILE):
-        return {"prefs": {}, "chat_id": None}
+def _default_state() -> Dict[str, Any]:
+    return {
+        "chat_id": None,
+        "prefs": {
+            "risk": None,               # "LOW"|"MEDIUM"|"HIGH"|None
+            "focus": [],                # ["BTC","ETH"...]
+            "avoid": [],                # ["ADA","XRP"...]
+            "avoid_memecoins": False,   # True/False
+        },
+    }
 
+
+def load_state() -> Dict[str, Any]:
     try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {"prefs": {}, "chat_id": None}
+        if not os.path.exists(STATE_PATH):
+            return _default_state()
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        base = _default_state()
+        base.update(data or {})
+        base["prefs"].update((data or {}).get("prefs", {}) or {})
+        base["prefs"]["focus"] = list(base["prefs"].get("focus", []) or [])
+        base["prefs"]["avoid"] = list(base["prefs"].get("avoid", []) or [])
+        base["prefs"]["avoid_memecoins"] = bool(base["prefs"].get("avoid_memecoins", False))
+        return base
+    except Exception:
+        return _default_state()
 
-def save_state(state):
 
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+def save_state(state: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
-def set_chat_id(chat_id):
 
-    state = load_state()
-    state["chat_id"] = chat_id
-    save_state(state)
+def set_chat_id(chat_id: int) -> None:
+    st = load_state()
+    st["chat_id"] = int(chat_id)
+    save_state(st)
 
-def update_prefs(patch):
 
-    state = load_state()
-    prefs = state.get("prefs", {})
+def update_prefs(patch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    patch puede incluir: risk, focus, avoid, avoid_memecoins
+    """
+    st = load_state()
+    prefs = st.get("prefs", {}) or {}
 
-    prefs.update(patch)
+    if "risk" in patch:
+        v = patch["risk"]
+        prefs["risk"] = v if v in {"LOW", "MEDIUM", "HIGH", None} else prefs.get("risk")
 
-    state["prefs"] = prefs
-    save_state(state)
+    if "avoid_memecoins" in patch:
+        prefs["avoid_memecoins"] = bool(patch["avoid_memecoins"])
+
+    if "focus" in patch and patch["focus"] is not None:
+        cur = set((prefs.get("focus") or []))
+        for c in patch["focus"]:
+            if isinstance(c, str) and 2 <= len(c) <= 6:
+                cur.add(c.upper())
+        prefs["focus"] = sorted(cur)
+
+    if "avoid" in patch and patch["avoid"] is not None:
+        cur = set((prefs.get("avoid") or []))
+        for c in patch["avoid"]:
+            if isinstance(c, str) and 2 <= len(c) <= 6:
+                cur.add(c.upper())
+        prefs["avoid"] = sorted(cur)
+
+    st["prefs"] = prefs
+    save_state(st)
+    return prefs
+
+
+def clear_prefs() -> None:
+    st = load_state()
+    st["prefs"] = _default_state()["prefs"]
+    save_state(st)
