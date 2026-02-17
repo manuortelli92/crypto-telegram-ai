@@ -10,14 +10,29 @@ KRAKEN_TICKER = "https://api.kraken.com/0/public/Ticker"
 
 DEFAULT_TIMEOUT = 20
 
+HEADERS = {"User-Agent": "OrtelliCryptoAI/1.0"}
+
+# Cache para evitar 429 en CoinGecko
+_COINGECKO_CACHE = {"ts": 0, "data": None}
+
 
 def _get_json(url: str, params=None, headers=None, timeout: int = DEFAULT_TIMEOUT):
+    headers = headers or HEADERS
     r = requests.get(url, params=params, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 
 def fetch_coingecko_top100(vs: str = "usd") -> List[dict]:
+    """
+    Devuelve top 100 por market cap desde CoinGecko.
+    Cachea 120s para evitar rate limit (429).
+    Si CoinGecko falla y hay cache, devuelve cache.
+    """
+    now = time.time()
+    if _COINGECKO_CACHE["data"] and (now - _COINGECKO_CACHE["ts"] < 120):
+        return _COINGECKO_CACHE["data"]
+
     params = {
         "vs_currency": vs,
         "order": "market_cap_desc",
@@ -26,30 +41,39 @@ def fetch_coingecko_top100(vs: str = "usd") -> List[dict]:
         "sparkline": False,
         "price_change_percentage": "7d,30d",
     }
-    data = _get_json(COINGECKO_MARKETS, params=params)
+
+    try:
+        data = _get_json(COINGECKO_MARKETS, params=params)
+    except Exception:
+        if _COINGECKO_CACHE["data"]:
+            return _COINGECKO_CACHE["data"]
+        raise
 
     rows = []
     for idx, coin in enumerate(data, start=1):
-        symbol = (coin.get("symbol") or "").upper().strip()
-        name = (coin.get("name") or "").strip()
-
         rows.append({
             "rank": idx,
             "id": coin.get("id"),
-            "symbol": symbol,
-            "name": name,
+            "symbol": (coin.get("symbol") or "").upper().strip(),
+            "name": (coin.get("name") or "").strip(),
             "price": float(coin.get("current_price", 0) or 0),
             "market_cap": float(coin.get("market_cap", 0) or 0),
             "volume_24h": float(coin.get("total_volume", 0) or 0),
             "mom_7d": float(coin.get("price_change_percentage_7d_in_currency", 0) or 0),
             "mom_30d": float(coin.get("price_change_percentage_30d_in_currency", 0) or 0),
         })
+
+    _COINGECKO_CACHE["data"] = rows
+    _COINGECKO_CACHE["ts"] = now
     return rows
 
 
 def binance_prices_usdt() -> Dict[str, float]:
+    """
+    Devuelve dict {"BTCUSDT": 67000.0, ...}
+    """
     data = _get_json(BINANCE_TICKER)
-    out = {}
+    out: Dict[str, float] = {}
     for it in data:
         sym = it.get("symbol")
         price = it.get("price")
@@ -62,10 +86,13 @@ def binance_prices_usdt() -> Dict[str, float]:
 
 
 def coinbase_price_usd(symbol: str) -> Optional[float]:
+    """
+    Coinbase spot ticker para SYMBOL-USD.
+    """
     product_id = f"{symbol}-USD"
     url = COINBASE_TICKER.format(product_id=product_id)
     try:
-        data = _get_json(url, headers={"User-Agent": "Mozilla/5.0"})
+        data = _get_json(url)
         p = data.get("price")
         return float(p) if p is not None else None
     except Exception:
@@ -73,9 +100,11 @@ def coinbase_price_usd(symbol: str) -> Optional[float]:
 
 
 def kraken_price_usd(symbol: str) -> Optional[float]:
+    """
+    Kraken ticker: intentamos varias variantes.
+    """
     pairs_try = [f"{symbol}USD"]
 
-    # mapeos comunes
     if symbol == "BTC":
         pairs_try += ["XXBTZUSD", "XBTUSD"]
     if symbol == "ETH":
@@ -86,6 +115,10 @@ def kraken_price_usd(symbol: str) -> Optional[float]:
         pairs_try += ["XRPUSD"]
     if symbol == "ADA":
         pairs_try += ["ADAUSD"]
+    if symbol == "DOGE":
+        pairs_try += ["DOGEUSD"]
+    if symbol == "BNB":
+        pairs_try += ["BNBUSD"]
 
     for pair in pairs_try:
         try:
@@ -100,7 +133,6 @@ def kraken_price_usd(symbol: str) -> Optional[float]:
                 return float(c[0])
         except Exception:
             continue
-
     return None
 
 
@@ -135,8 +167,8 @@ def verify_prices(
     """
     bn = binance_prices_usdt()
 
-    enriched = []
-    spreads = []
+    enriched: List[dict] = []
+    spreads: List[float] = []
     verified_count = 0
     total = 0
 
@@ -145,7 +177,7 @@ def verify_prices(
         if not sym:
             continue
 
-        sources = {}
+        sources: Dict[str, float] = {}
 
         # Binance USDT
         bkey = f"{sym}USDT"
@@ -162,6 +194,11 @@ def verify_prices(
         kk = kraken_price_usd(sym)
         if kk is not None:
             sources["kraken"] = kk
+
+        # CoinGecko (ya viene en r["price"]) como fuente también
+        cg_price = r.get("price")
+        if cg_price is not None and float(cg_price) > 0:
+            sources["coingecko"] = float(cg_price)
 
         prices = list(sources.values())
         anchor = median(prices)
@@ -181,7 +218,7 @@ def verify_prices(
                     sources_ok += 1
 
             verified = sources_ok >= 2
-            spreads.append(spread_pct)
+            spreads.append(float(spread_pct))
 
         rr = dict(r)
         rr["sources"] = sources
