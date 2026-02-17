@@ -8,19 +8,20 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.error import Conflict, NetworkError, TimedOut
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from core.memory import load_state, set_chat_id, update_prefs
+from core.memory import load_state, set_chat_id
 from core.learning import register_user_interest
 from core.engine import build_engine_analysis
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Falta BOT_TOKEN")
 
 OWNER_ID = os.getenv("OWNER_ID", "").strip()
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "12"))
 
+SCHEDULE_DOW = os.getenv("SCHEDULE_DOW", "mon")
 SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "9"))
 SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
 
@@ -29,7 +30,7 @@ _user_hits = {}
 
 def is_owner(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
-    return str(uid) == str(OWNER_ID)
+    return bool(OWNER_ID) and str(uid) == str(OWNER_ID)
 
 
 def rate_limit_ok(user_id: int) -> bool:
@@ -46,44 +47,6 @@ def rate_limit_ok(user_id: int) -> bool:
     return True
 
 
-def extract_prefs_patch(text: str) -> dict:
-    """
-    Parseo simple en español:
-      - "evita memecoins" / "sin memecoins"
-      - "prefiero SOL ETH"
-      - "evita ADA XRP"
-      - "riesgo bajo/medio/alto"
-    """
-    t = (text or "").lower().strip()
-    patch = {}
-
-    if any(k in t for k in ["evita memecoins", "sin memecoins", "no memecoins", "no memecoin", "sin memecoin"]):
-        patch["avoid_memecoins"] = True
-    if any(k in t for k in ["permiti memecoins", "permití memecoins", "con memecoins", "habilita memecoins"]):
-        patch["avoid_memecoins"] = False
-
-    if any(k in t for k in ["riesgo bajo", "conservador", "risk low", "low"]):
-        patch["risk"] = "LOW"
-    if any(k in t for k in ["riesgo medio", "medium"]):
-        patch["risk"] = "MEDIUM"
-    if any(k in t for k in ["riesgo alto", "agresivo", "risk high", "high"]):
-        patch["risk"] = "HIGH"
-
-    if "prefiero " in t:
-        part = t.split("prefiero ", 1)[1]
-        coins = part.replace(",", " ").upper().split()
-        patch["focus"] = [c for c in coins if c.isalpha() and 2 <= len(c) <= 6]
-
-    if "evita " in t:
-        part = t.split("evita ", 1)[1]
-        coins = part.replace(",", " ").upper().split()
-        # ojo: si dice "evita memecoins" no lo tratamos como tickers
-        coins = [c for c in coins if c not in {"MEMECOINS", "MEMECOIN"}]
-        patch["avoid"] = [c for c in coins if c.isalpha() and 2 <= len(c) <= 6]
-
-    return patch
-
-
 async def send_weekly(application: Application):
     state = load_state()
     chat_id = state.get("chat_id")
@@ -93,7 +56,7 @@ async def send_weekly(application: Application):
         text = build_engine_analysis("informe semanal")
         await application.bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
-        logging.error("weekly send failed: %s", e)
+        logging.exception("weekly send failed: %s", e)
 
 
 async def on_startup(app: Application):
@@ -101,7 +64,7 @@ async def on_startup(app: Application):
     scheduler.add_job(
         lambda: send_weekly(app),
         "cron",
-        day_of_week="mon",
+        day_of_week=SCHEDULE_DOW,
         hour=SCHEDULE_HOUR,
         minute=SCHEDULE_MINUTE,
         id="weekly_report",
@@ -119,40 +82,38 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user.id
     text = (update.message.text or "").strip()
 
+    # Rate limit solo usuarios normales
     if not is_owner(update):
         if not rate_limit_ok(uid):
-            await update.message.reply_text("Demasiadas solicitudes. Espera 1 minuto.")
+            await update.message.reply_text("Demasiadas solicitudes. Esperá 1 minuto.")
             return
 
-    register_user_interest(text)
+    # aprendizaje (solo ponderaciones, no “entrena” un modelo)
+    if text:
+        register_user_interest(text)
 
-    if text == "/start" or text.lower() in ["start", "hola", "buenas", "hey"]:
+    # /start como texto normal
+    low = text.lower()
+    if text == "/start" or low in {"start", "hola", "buenas", "hey"}:
         await update.message.reply_text(
-            "Hablame normal.\n"
+            "Escribime normal.\n"
             "Ej: 'diario', 'semanal', 'mensual', 'top 30 riesgo medio', 'BTC hoy?'\n"
-            "Si sos el owner, también podés fijar preferencias:\n"
-            "- 'evita memecoins'\n"
-            "- 'prefiero SOL ETH'\n"
-            "- 'evita ADA XRP'\n"
-            "- 'riesgo bajo/medio/alto'\n"
+            "También: 'prefiero SOL ETH' o 'evita memecoins'."
         )
         if is_owner(update):
             set_chat_id(int(chat.id))
         return
 
+    # guardo chat_id del owner para el semanal
     if is_owner(update):
         set_chat_id(int(chat.id))
-        patch = extract_prefs_patch(text)
-        if patch:
-            prefs = update_prefs(patch)
-            await update.message.reply_text(f"OK. Preferencias guardadas: {prefs}")
-            return
 
     await update.message.reply_text("Analizando...")
     try:
         reply = build_engine_analysis(text)
         await update.message.reply_text(reply)
     except Exception as e:
+        logging.exception("engine error: %s", e)
         await update.message.reply_text(f"Error: {type(e).__name__}: {e}")
 
 
@@ -163,6 +124,7 @@ def build_app() -> Application:
 
 
 def main():
+    # resiliencia: red/timeout ok; Conflict NO se arregla con código si hay 2 instancias
     while True:
         try:
             app = build_app()
@@ -170,15 +132,15 @@ def main():
             return
 
         except Conflict as e:
-            logging.error("Telegram Conflict (otra instancia usando getUpdates). %s", e)
+            logging.error("Conflict: hay otra instancia haciendo polling. Dejá 1 sola replica. %s", e)
             time.sleep(10)
 
         except (TimedOut, NetworkError) as e:
-            logging.error("Error de red/timeout. Reintentando en 5s: %s", e)
+            logging.error("Red/timeout. Reintento en 5s: %s", e)
             time.sleep(5)
 
         except Exception as e:
-            logging.error("Error inesperado. Reintentando en 10s: %s", e)
+            logging.error("Error inesperado. Reintento en 10s: %s", e)
             time.sleep(10)
 
 
