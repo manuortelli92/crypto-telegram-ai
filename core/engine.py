@@ -2,21 +2,24 @@ import os
 import json
 from typing import List, Dict, Optional
 
-from core.market import fetch_top100_market, split_alts_and_majors, estimate_risk, is_stable
+from core.market import (
+    fetch_top100_market,
+    split_alts_and_majors,
+    estimate_risk,
+    is_stable,
+    is_gold,
+)
 from core.learning import get_learning_boost
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-
-# ---------------------------
-# Helpers formato
-# ---------------------------
 
 def pct(x: float) -> str:
     try:
         return f"{x:+.2f}%"
     except Exception:
         return "n/a"
+
 
 def price_fmt(p: float) -> str:
     try:
@@ -29,6 +32,7 @@ def price_fmt(p: float) -> str:
         return f"${p:.6f}"
     except Exception:
         return "n/a"
+
 
 def money(x: float) -> str:
     try:
@@ -45,10 +49,6 @@ def money(x: float) -> str:
         return "n/a"
 
 
-# ---------------------------
-# Parsing natural
-# ---------------------------
-
 def detect_mode(text: str) -> str:
     t = (text or "").lower()
     if any(k in t for k in ["mensual", "mes"]):
@@ -58,6 +58,7 @@ def detect_mode(text: str) -> str:
     if any(k in t for k in ["semanal", "semana", "7d"]):
         return "SEMANAL"
     return "SEMANAL"
+
 
 def parse_top_n(text: str, default: int = 20) -> int:
     t = (text or "").lower()
@@ -71,6 +72,7 @@ def parse_top_n(text: str, default: int = 20) -> int:
         return 20
     return default
 
+
 def detect_risk_pref(text: str) -> Optional[str]:
     t = (text or "").lower()
     if any(k in t for k in ["bajo", "conserv", "low"]):
@@ -81,6 +83,7 @@ def detect_risk_pref(text: str) -> Optional[str]:
         return "HIGH"
     return None
 
+
 def extract_symbol(text: str) -> Optional[str]:
     if not text:
         return None
@@ -88,15 +91,11 @@ def extract_symbol(text: str) -> Optional[str]:
     for tok in tokens:
         up = tok.upper().strip()
         if 2 <= len(up) <= 6 and up.isalpha():
-            if up in {"HOLA", "HOY", "INFO", "TOP", "DAME", "QUIERO", "RIESGO"}:
+            if up in {"HOLA", "HOY", "INFO", "TOP", "DAME", "QUIERO", "RIESGO", "SEMANAL", "DIARIO", "MENSUAL"}:
                 continue
             return up
     return None
 
-
-# ---------------------------
-# Scoring (mismo criterio)
-# ---------------------------
 
 def compute_engine_score(row: Dict) -> float:
     mom7 = float(row.get("mom_7d", 0) or 0)
@@ -130,12 +129,8 @@ def compute_engine_score(row: Dict) -> float:
     return base + consistency + dd_penalty + liq + learn
 
 
-# ---------------------------
-# Selección balanceada
-# ---------------------------
-
 def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
-    m_target = max(3, min(10, round(total * 0.35)))
+    m_target = max(4, min(10, round(total * 0.35)))
     a_target = total - m_target
 
     majors_sel = majors[:m_target]
@@ -144,6 +139,7 @@ def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
     if len(majors_sel) < m_target:
         need = m_target - len(majors_sel)
         alts_sel = (alts_sel + alts[a_target:a_target + need])[:total]
+
     if len(alts_sel) < a_target:
         need = a_target - len(alts_sel)
         majors_sel = (majors_sel + majors[m_target:m_target + need])[:total]
@@ -151,13 +147,10 @@ def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
     return majors_sel, alts_sel
 
 
-# ---------------------------
-# Raw report (la “verdad”)
-# ---------------------------
-
 def raw_report(mode: str, top_n: int, majors: List[Dict], alts: List[Dict]) -> str:
     lines = []
     lines.append(f"Panorama {mode} | Top {top_n}")
+
     lines.append("")
     lines.append("NO-ALTS")
     for i, r in enumerate(majors, 1):
@@ -166,6 +159,7 @@ def raw_report(mode: str, top_n: int, majors: List[Dict], alts: List[Dict]) -> s
             f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
             f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
         )
+
     lines.append("")
     lines.append("ALTS")
     for i, r in enumerate(alts, 1):
@@ -174,7 +168,9 @@ def raw_report(mode: str, top_n: int, majors: List[Dict], alts: List[Dict]) -> s
             f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
             f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
         )
+
     return "\n".join(lines)
+
 
 def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], alts: List[Dict]) -> str:
     def compact(items):
@@ -198,43 +194,35 @@ def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], al
         "risk_pref": risk_pref,
         "no_alts": compact(majors),
         "alts": compact(alts),
-        "rules": {
-            "no_invent": True,
-            "use_only_payload": True,
-        }
+        "rules": {"use_only_payload": True},
     }
     return json.dumps(payload, ensure_ascii=False)
 
 
-# ---------------------------
-# LLM layer (solo redacta)
-# ---------------------------
-
-def llm_render(user_text: str, payload_json: str, payload_text: str) -> str:
+def llm_render(user_text: str, payload_json: str, fallback_text: str) -> str:
     if not OPENAI_API_KEY:
-        return payload_text
+        return fallback_text
 
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
-        return payload_text
+        return fallback_text
 
     system = (
-        "Sos un analista cripto prudente. Escribís en español rioplatense, claro, directo y conversacional. "
+        "Sos un analista cripto prudente. Escribís en español rioplatense, claro y conversacional. "
         "No das asesoramiento financiero. No uses titulares ni notas largas. "
-        "REGLA: Solo podés usar datos dentro del JSON provisto. No inventes."
+        "REGLA: solo podés usar datos dentro del JSON. No inventes."
     )
 
     user = (
         f"Usuario dijo: {user_text}\n\n"
-        f"JSON de datos (fuente única de verdad):\n{payload_json}\n\n"
-        "Tarea:\n"
-        "- Respondé como chat fluido.\n"
+        f"JSON (fuente única):\n{payload_json}\n\n"
+        "Respondé:\n"
         "- 2-3 líneas de panorama.\n"
-        "- 3 a 6 ideas concretas (mezclá no-alts y alts), cada una con: por qué entra, riesgo, y qué invalidaría.\n"
-        "- Si falta info (monto, horizonte, riesgo), hacé 1 pregunta corta.\n"
-        "- No repitas todas las líneas del listado, seleccioná lo importante.\n"
+        "- 3 a 6 ideas concretas (mezclá no-alts y alts): por qué entra, riesgo, y qué invalida.\n"
+        "- Si falta info, hacé 1 pregunta corta.\n"
+        "- No pegues el listado entero.\n"
     )
 
     try:
@@ -244,14 +232,10 @@ def llm_render(user_text: str, payload_json: str, payload_text: str) -> str:
             temperature=0.35,
         )
         out = resp.choices[0].message.content.strip()
-        return out if out else payload_text
+        return out if out else fallback_text
     except Exception:
-        return payload_text
+        return fallback_text
 
-
-# ---------------------------
-# Entry
-# ---------------------------
 
 def build_engine_analysis(user_text: str) -> str:
     mode = detect_mode(user_text)
@@ -260,7 +244,12 @@ def build_engine_analysis(user_text: str) -> str:
     symbol = extract_symbol(user_text)
 
     rows = fetch_top100_market()
-    rows = [r for r in rows if r.get("symbol") and not is_stable(r)]
+
+    # FILTROS CLAVE: afuera stables y oro
+    rows = [
+        r for r in rows
+        if r.get("symbol") and (not is_stable(r)) and (not is_gold(r))
+    ]
 
     enriched = []
     for r in rows:
@@ -271,7 +260,7 @@ def build_engine_analysis(user_text: str) -> str:
 
     enriched.sort(key=lambda x: x["engine_score"], reverse=True)
 
-    # Si pregunta por símbolo, devolvemos mini-brief sin LLM (datos directos)
+    # Si pregunta por símbolo, devolvemos ficha corta (datos directos)
     if symbol and any(k in (user_text or "").lower() for k in ["?", "como", "ves", "hoy", "seman", "mes"]):
         r = next((x for x in enriched if x["symbol"] == symbol), None)
         if not r:
@@ -287,8 +276,7 @@ def build_engine_analysis(user_text: str) -> str:
     majors, alts = split_alts_and_majors(top)
     majors, alts = pick_balanced(majors, alts, top_n)
 
-    text = raw_report(mode, top_n, majors, alts)
+    fallback = raw_report(mode, top_n, majors, alts)
     payload = raw_compact_json(mode, risk_pref, majors, alts)
 
-    # IA usa el MISMO payload del engine clásico (misma info, misma selección)
-    return llm_render(user_text, payload, text)
+    return llm_render(user_text, payload, fallback)
