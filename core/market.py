@@ -1,7 +1,11 @@
+import time
 import requests
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
+HEADERS = {"User-Agent": "OrtelliCryptoAI/1.0"}
+TIMEOUT = 25
 
+# NO-ALTS = majors explícitos + top10 por market cap
 MAJORS_SET = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOGE", "DOT", "TRX", "LINK"}
 
 STABLES = {
@@ -11,17 +15,24 @@ STABLES = {
 
 GOLD = {"XAUT", "PAXG"}
 
+_TTL = 300  # 5 min cache CoinGecko
+_CACHE = {"ts": 0, "rows": None}
+
 
 def fetch_top100_market(vs="usd"):
+    now = time.time()
+    if _CACHE["rows"] is not None and (now - _CACHE["ts"] < _TTL):
+        return _CACHE["rows"]
+
     params = {
         "vs_currency": vs,
         "order": "market_cap_desc",
         "per_page": 100,
         "page": 1,
-        "sparkline": False,
+        "sparkline": "false",
         "price_change_percentage": "7d,30d",
     }
-    r = requests.get(COINGECKO_URL, params=params, timeout=25)
+    r = requests.get(COINGECKO_URL, params=params, timeout=TIMEOUT, headers=HEADERS)
     r.raise_for_status()
 
     data = r.json()
@@ -41,11 +52,14 @@ def fetch_top100_market(vs="usd"):
             "mom_7d": coin.get("price_change_percentage_7d_in_currency", 0) or 0,
             "mom_30d": coin.get("price_change_percentage_30d_in_currency", 0) or 0,
         })
+
+    _CACHE["ts"] = now
+    _CACHE["rows"] = rows
     return rows
 
 
 def is_stable(row) -> bool:
-    sym = row.get("symbol", "")
+    sym = (row.get("symbol") or "").upper()
     if sym in STABLES:
         return True
 
@@ -63,18 +77,16 @@ def is_stable(row) -> bool:
 
 
 def is_gold(row) -> bool:
-    sym = row.get("symbol", "")
+    sym = (row.get("symbol") or "").upper()
     if sym in GOLD:
         return True
     name = (row.get("name") or "").lower()
-    if "gold" in name:
-        return True
-    return False
+    return "gold" in name
 
 
 def is_major(row) -> bool:
-    sym = row.get("symbol", "")
-    rank = row.get("rank", 999)
+    sym = (row.get("symbol") or "").upper()
+    rank = int(row.get("rank", 999) or 999)
     return (sym in MAJORS_SET) or (rank <= 10)
 
 
@@ -89,7 +101,7 @@ def split_alts_and_majors(rows):
 
 
 def estimate_risk(row) -> str:
-    cap = row.get("market_cap", 0) or 0
+    cap = float(row.get("market_cap", 0) or 0)
     if cap >= 200_000_000_000:
         return "LOW"
     if cap >= 30_000_000_000:
