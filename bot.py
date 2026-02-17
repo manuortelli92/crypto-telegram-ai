@@ -1,9 +1,11 @@
 import os
-import math
 import time
+import math
+import logging
+from typing import List, Dict, Tuple, Optional
+
 import requests
 import numpy as np
-import logging
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -12,35 +14,34 @@ logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("Falta BOT_TOKEN en Railway > Variables")
+    raise RuntimeError("Missing BOT_TOKEN env var. Set it in Railway > Variables.")
 
-# === Config básica ===
-TIMEFRAME = os.getenv("TIMEFRAME", "1d")   # binance interval
-LIMIT = int(os.getenv("CANDLE_LIMIT", "200"))
+# Config (you can override with Railway Variables if you want)
+TIMEFRAME = os.getenv("TIMEFRAME", "1d")          # Binance interval
+CANDLE_LIMIT = int(os.getenv("CANDLE_LIMIT", "200"))
 PRICE_GAP_TOL = float(os.getenv("PRICE_GAP_TOL", "0.02"))  # 2%
 
-# Universo inicial (lo ampliamos después)
-UNIVERSE = [
-    ("Bitcoin",  "BTCUSDT", "bitcoin"),
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+
+# (name, binance_symbol, coingecko_id)
+UNIVERSE: List[Tuple[str, str, str]] = [
+    ("Bitcoin", "BTCUSDT", "bitcoin"),
     ("Ethereum", "ETHUSDT", "ethereum"),
-    ("Solana",   "SOLUSDT", "solana"),
-    ("BNB",      "BNBUSDT", "binancecoin"),
-    ("XRP",      "XRPUSDT", "ripple"),
-    ("Cardano",  "ADAUSDT", "cardano"),
-    ("Avalanche","AVAXUSDT","avalanche-2"),
-    ("Chainlink","LINKUSDT","chainlink"),
+    ("Solana", "SOLUSDT", "solana"),
+    ("BNB", "BNBUSDT", "binancecoin"),
+    ("XRP", "XRPUSDT", "ripple"),
+    ("Cardano", "ADAUSDT", "cardano"),
+    ("Avalanche", "AVAXUSDT", "avalanche-2"),
+    ("Chainlink", "LINKUSDT", "chainlink"),
 ]
 
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
-DEFILLAMA_PROTOCOLS = "https://api.llama.fi/protocols"
 
-
-def fetch_binance_klines(symbol: str, interval: str, limit: int):
+def fetch_binance_closes(symbol: str, interval: str, limit: int) -> Tuple[List[float], Optional[float]]:
     r = requests.get(
-        BINANCE_KLINES,
+        BINANCE_KLINES_URL,
         params={"symbol": symbol, "interval": interval, "limit": limit},
-        timeout=25
+        timeout=25,
     )
     r.raise_for_status()
     data = r.json()
@@ -49,29 +50,14 @@ def fetch_binance_klines(symbol: str, interval: str, limit: int):
     return closes, last_close
 
 
-def coingecko_markets(ids: list[str]):
+def fetch_coingecko_markets(ids: List[str]) -> List[Dict]:
     r = requests.get(
-        COINGECKO_MARKETS,
+        COINGECKO_MARKETS_URL,
         params={"vs_currency": "usd", "ids": ",".join(ids), "per_page": 250, "page": 1},
-        timeout=25
+        timeout=25,
     )
     r.raise_for_status()
     return r.json()
-
-
-def defillama_index():
-    r = requests.get(DEFILLAMA_PROTOCOLS, timeout=30)
-    r.raise_for_status()
-    idx = {}
-    for p in r.json():
-        name = (p.get("name") or "").strip().lower()
-        if name:
-            idx[name] = {
-                "tvl": p.get("tvl"),
-                "category": p.get("category"),
-                "url": p.get("url"),
-            }
-    return idx
 
 
 def pct_change(a: float, b: float) -> float:
@@ -80,13 +66,12 @@ def pct_change(a: float, b: float) -> float:
     return (b - a) / a
 
 
-def features_from_closes(closes: list[float]) -> dict:
+def features_from_closes(closes: List[float]) -> Dict[str, float]:
     if len(closes) < 35:
         return {"mom_7d": 0.0, "mom_30d": 0.0, "vol_30d": 0.0, "dd_30d": 0.0}
 
     c = np.array(closes, dtype=float)
     last = c[-1]
-
     mom_7d = pct_change(c[-8], last)
     mom_30d = pct_change(c[-31], last)
 
@@ -100,7 +85,7 @@ def features_from_closes(closes: list[float]) -> dict:
     return {"mom_7d": float(mom_7d), "mom_30d": float(mom_30d), "vol_30d": float(vol_30d), "dd_30d": float(dd_30d)}
 
 
-def score_asset(feat: dict, vol24h_usd: float | None, verified: bool, has_defi: bool) -> dict:
+def score_asset(feat: Dict[str, float], vol24h_usd: Optional[float], verified: bool) -> Dict[str, object]:
     mom_7d = feat["mom_7d"]
     mom_30d = feat["mom_30d"]
     vol = feat["vol_30d"]
@@ -122,13 +107,10 @@ def score_asset(feat: dict, vol24h_usd: float | None, verified: bool, has_defi: 
         elif vol24h_usd > 200_000_000:
             s += 6.0
 
-    if has_defi:
-        s += 4.0
-
     if not verified:
         s -= 25.0
 
-    s = max(0.0, min(100.0, float(s)))
+    s = float(max(0.0, min(100.0, s)))
 
     risk = "LOW"
     if vol > 0.9 or (vol24h_usd is not None and vol24h_usd < 10_000_000):
@@ -140,110 +122,86 @@ def score_asset(feat: dict, vol24h_usd: float | None, verified: bool, has_defi: 
 
 
 def fmt_pct(x: float) -> str:
-    return f"{x*100:.2f}%"
+    return f"{x * 100:.2f}%"
 
 
 def build_report(top_n: int = 5) -> str:
-    ids = [cg for _, _, cg in UNIVERSE]
-    cg = coingecko_markets(ids)
-    cg_map = {m["id"]: m for m in cg}
-    defi = defillama_index()
+    ids = [cg_id for _, _, cg_id in UNIVERSE]
+    cg_list = fetch_coingecko_markets(ids)
+    cg_map = {m["id"]: m for m in cg_list}
 
     rows = []
     for name, bsymbol, cg_id in UNIVERSE:
         m = cg_map.get(cg_id, {})
         cg_price = m.get("current_price")
         cg_vol = m.get("total_volume")
-        cg_mcap = m.get("market_cap")
 
         verified = True
-        price_ok = True
-
         closes = []
         last_close = None
+
         try:
-            closes, last_close = fetch_binance_klines(bsymbol, TIMEFRAME, LIMIT)
+            closes, last_close = fetch_binance_closes(bsymbol, TIMEFRAME, CANDLE_LIMIT)
         except Exception:
             verified = False
 
         if cg_price and last_close:
-            gap = abs(cg_price - last_close) / cg_price
+            gap = abs(float(cg_price) - float(last_close)) / float(cg_price)
             if gap > PRICE_GAP_TOL:
-                price_ok = False
                 verified = False
 
         feat = features_from_closes(closes) if closes else {"mom_7d": 0.0, "mom_30d": 0.0, "vol_30d": 0.0, "dd_30d": 0.0}
-
-        dl = defi.get(name.lower())
-        has_defi = dl is not None
-
-        scored = score_asset(feat, vol24h_usd=cg_vol, verified=verified, has_defi=has_defi)
+        scored = score_asset(feat, vol24h_usd=cg_vol, verified=verified)
 
         rows.append({
             "name": name,
-            "sym": bsymbol,
+            "symbol": bsymbol,
             "score": scored["score"],
             "risk": scored["risk"],
             "mom_30d": feat["mom_30d"],
             "vol_30d": feat["vol_30d"],
             "verified": verified,
-            "cg_price": cg_price,
-            "bn_close": last_close,
-            "price_ok": price_ok,
-            "cg_vol": cg_vol,
-            "cg_mcap": cg_mcap,
-            "tvl": (dl.get("tvl") if dl else None),
         })
 
-    rows.sort(key=lambda x: x["score"], reverse=True)
+    rows.sort(key=lambda x: float(x["score"]), reverse=True)
     top = rows[:top_n]
 
     lines = []
-    lines.append("🧠 Weekly/Daily Crypto Brief (verificado)")
-    lines.append(f"🕒 {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC")
+    lines.append("Crypto Brief (verified)")
+    lines.append(time.strftime("Generated UTC: %Y-%m-%d %H:%M:%S", time.gmtime()))
     lines.append("")
-    lines.append("Top opciones (vos decidís):")
-
+    lines.append("Top options (you decide):")
     for i, r in enumerate(top, 1):
-        tvl_txt = f" | TVL: {int(r['tvl']):,}" if isinstance(r["tvl"], (int, float)) else ""
         lines.append(
-            f"{i}) {r['name']} ({r['sym']}) — Score {r['score']:.1f} | Risk {r['risk']} | "
-            f"Mom30d {fmt_pct(r['mom_30d'])} | Verified {r['verified']}{tvl_txt}"
+            f"{i}) {r['name']} ({r['symbol']}) | Score {r['score']:.1f} | Risk {r['risk']} | "
+            f"Mom30d {fmt_pct(float(r['mom_30d']))} | Verified {r['verified']}"
         )
-
     lines.append("")
-    lines.append("Verificación:")
-    lines.append("- Binance klines (histórico) + CoinGecko (market data).")
-    lines.append(f"- Si gap de precio > {PRICE_GAP_TOL*100:.0f}% → NO verificado y penaliza score.")
-    lines.append("_Info, no asesoramiento financiero._")
+    lines.append("Verification: Binance klines + CoinGecko markets; if price gap > "
+                 f"{int(PRICE_GAP_TOL * 100)}% then NOT verified and score is penalized.")
+    lines.append("Info only, not financial advice.")
     return "\n".join(lines)
 
 
-# === Telegram handlers ===
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🤖 Estoy online.\n\nComandos:\n/daily\n/weekly\n\nTe devuelvo opciones con verificación (Binance + CoinGecko)."
+        "Bot is online.\nCommands:\n/start\n/daily\n"
     )
 
 
-async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Analizando... (puede tardar 5-15s)")
-    text = build_report(top_n=5)
-    await update.message.reply_text(text)
+async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Running analysis... (5-15s)")
+    try:
+        text = build_report(top_n=5)
+        await update.message.reply_text(text)
+    except Exception as e:
+        await update.message.reply_text(f"Error: {type(e).__name__}: {e}")
 
 
-async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Armando brief semanal... (puede tardar 5-15s)")
-    text = build_report(top_n=7)
-    await update.message.reply_text(text)
-
-
-def main():
+def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("daily", daily_cmd))
-    app.add_handler(CommandHandler("weekly", weekly_cmd))
-
     app.run_polling()
 
 
