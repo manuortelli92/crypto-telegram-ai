@@ -1,6 +1,6 @@
 import os
 import json
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from core.market import (
     fetch_top100_market,
@@ -10,6 +10,7 @@ from core.market import (
     is_gold,
 )
 from core.learning import get_learning_boost
+from core.sources import verify_price_multi_source
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
@@ -23,6 +24,7 @@ def pct(x: float) -> str:
 
 def price_fmt(p: float) -> str:
     try:
+        p = float(p)
         if p >= 1000:
             return f"${p:,.0f}"
         if p >= 1:
@@ -36,6 +38,7 @@ def price_fmt(p: float) -> str:
 
 def money(x: float) -> str:
     try:
+        x = float(x)
         if x >= 1_000_000_000_000:
             return f"${x/1_000_000_000_000:.2f}T"
         if x >= 1_000_000_000:
@@ -62,21 +65,16 @@ def detect_mode(text: str) -> str:
 
 def parse_top_n(text: str, default: int = 20) -> int:
     t = (text or "").lower()
-    if "top " in t:
-        # top 20 / top 30 etc
-        try:
-            after = t.split("top ", 1)[1].strip()
-            n = int(after.split()[0])
-            return max(5, min(50, n))
-        except Exception:
-            pass
-
-    # si escribió un número suelto, lo tomamos como top_n (con límites)
     for tok in t.replace(",", " ").split():
         if tok.isdigit():
             n = int(tok)
-            return max(5, min(50, n))
-
+            return max(10, min(50, n))
+    if "top 10" in t:
+        return 10
+    if "top 20" in t:
+        return 20
+    if "top 30" in t:
+        return 30
     return default
 
 
@@ -91,53 +89,50 @@ def detect_risk_pref(text: str) -> Optional[str]:
     return None
 
 
-def _tokenize(text: str) -> List[str]:
+def detect_request_kind(text: str) -> str:
+    t = (text or "").lower()
+    if any(k in t for k in ["top", "lista", "ranking", "mostrame", "mostrá"]):
+        return "LIST"
+    if any(k in t for k in ["informe", "panorama", "resumen", "diario", "semanal", "mensual"]):
+        return "BRIEF"
+    # pregunta abierta
+    return "CHAT"
+
+
+def extract_symbol(text: str) -> Optional[str]:
+    """
+    Detecta símbolos reales sin confundir palabras comunes.
+    Acepta 2..5 letras, alpha, y bloquea vocabulario normal.
+    """
     if not text:
-        return []
-    return (
+        return None
+
+    BLOCKED = {
+        "HOLA","HOY","INFO","TOP","DAME","QUIERO","RIESGO",
+        "SEMANAL","DIARIO","MENSUAL","INFORME","PANORAMA","RESUMEN",
+        "PEDIDO","USER","ACTUAL","PARAMETROS","PARAMS",
+        "MODE","FOCUS","AVOID","PREFIERO","EVITA","LISTA","RANKING",
+        "ANALIZANDO","GRACIAS"
+    }
+
+    tokens = (
         text.replace(",", " ")
         .replace("?", " ")
         .replace("!", " ")
         .replace(":", " ")
         .replace("(", " ")
         .replace(")", " ")
-        .replace("/", " ")
-        .replace("\\", " ")
         .split()
     )
 
-
-def extract_symbol(text: str) -> Optional[str]:
-    """
-    FIX: evita tomar palabras del contexto (PEDIDO/CONTEXTO/etc) como si fueran tickers.
-    Regla: solo 2-6 letras, alpha, y NO en blacklist. Para >=5 letras exigimos que parezca ticker real.
-    """
-    BLOCKED = {
-        "HOLA", "HOY", "INFO", "TOP", "DAME", "QUIERO", "RIESGO",
-        "SEMANAL", "DIARIO", "MENSUAL",
-        "PEDIDO", "ACTUAL", "CONTEXTO", "PARAMETROS", "PARAMETROS", "PARAMS",
-        "MODE", "FOCUS", "AVOID", "PREFIERO", "EVITA", "INFORME"
-    }
-
-    # allowlist chica para tickers de 5 letras que suelen existir y la gente pregunta
-    ALLOW_5PLUS = {"USDT", "USDC", "DAI", "PAXG", "XAUT"}  # igual luego se filtran stables/oro
-
-    for tok in _tokenize(text):
+    for tok in tokens:
         up = tok.upper().strip()
-
         if not up.isalpha():
             continue
-
+        if len(up) < 2 or len(up) > 5:
+            continue
         if up in BLOCKED:
             continue
-
-        if len(up) < 2 or len(up) > 6:
-            continue
-
-        # Para 5-6 letras: solo si está en allowlist (reduce falsos positivos tipo PEDIDO)
-        if len(up) >= 5 and up not in ALLOW_5PLUS:
-            continue
-
         return up
 
     return None
@@ -146,7 +141,6 @@ def extract_symbol(text: str) -> Optional[str]:
 def compute_engine_score(row: Dict) -> float:
     mom7 = float(row.get("mom_7d", 0) or 0)
     mom30 = float(row.get("mom_30d", 0) or 0)
-
     base = (mom7 * 0.65) + (mom30 * 0.35)
 
     consistency = 0.0
@@ -170,13 +164,19 @@ def compute_engine_score(row: Dict) -> float:
         ratio = vol / cap
         liq = min(ratio * 150.0, 8.0)
 
-    learn = float(get_learning_boost(row.get("symbol", "")) or 0)
+    learn = float(get_learning_boost(row["symbol"]) or 0)
 
-    return base + consistency + dd_penalty + liq + learn
+    # Verificación multi-fuente: bonus si otras fuentes confirman el precio
+    anchor = float(row.get("price", 0) or 0)
+    ok_sources, _used = verify_price_multi_source(anchor, row["symbol"], tolerance_pct=2.0)
+    verify_bonus = min(ok_sources * 1.5, 4.5)  # máximo +4.5
+
+    return base + consistency + dd_penalty + liq + learn + verify_bonus
 
 
-def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
-    m_target = max(4, min(10, round(total * 0.35)))
+def pick_balanced(majors: List[Dict], alts: List[Dict], total: int) -> Tuple[List[Dict], List[Dict]]:
+    # 40% majors (mínimo 5 si hay), resto alts
+    m_target = max(5, min(12, round(total * 0.40)))
     a_target = total - m_target
 
     majors_sel = majors[:m_target]
@@ -193,38 +193,49 @@ def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
     return majors_sel, alts_sel
 
 
-def raw_report(mode: str, top_n: int, majors: List[Dict], alts: List[Dict]) -> str:
-    lines = []
-    lines.append(f"Panorama {mode} | Top {top_n}")
-    lines.append("")
+def _enrich(rows: List[Dict]) -> List[Dict]:
+    enriched = []
+    for r in rows:
+        rr = dict(r)
+        rr["risk"] = estimate_risk(rr)
+        anchor = float(rr.get("price", 0) or 0)
+        ok_sources, used = verify_price_multi_source(anchor, rr["symbol"], tolerance_pct=2.0)
+        rr["sources_ok"] = int(ok_sources)
+        rr["sources_used"] = used
+        rr["engine_score"] = compute_engine_score(rr)
+        enriched.append(rr)
+    enriched.sort(key=lambda x: x["engine_score"], reverse=True)
+    return enriched
 
-    lines.append("NO-ALTS")
+
+def _row_line(r: Dict, idx: int) -> str:
+    return (
+        f"{idx:>2}) {r['symbol']} | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
+        f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | "
+        f"precio {price_fmt(r['price'])} | mcap {money(r['market_cap'])} | "
+        f"src_ok {r.get('sources_ok', 0)}"
+    )
+
+
+def _list_output(mode: str, top_n: int, majors: List[Dict], alts: List[Dict]) -> str:
+    lines = [f"Panorama {mode} | Top {top_n}", "", "NO-ALTS"]
     if not majors:
-        lines.append("(sin resultados en NO-ALTS con los filtros actuales)")
+        lines.append("(sin resultados en NO-ALTS)")
     else:
         for i, r in enumerate(majors, 1):
-            lines.append(
-                f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
-                f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
-                f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
-            )
+            lines.append(_row_line(r, i))
 
-    lines.append("")
-    lines.append("ALTS")
+    lines += ["", "ALTS"]
     if not alts:
-        lines.append("(sin resultados en ALTS con los filtros actuales)")
+        lines.append("(sin resultados en ALTS)")
     else:
         for i, r in enumerate(alts, 1):
-            lines.append(
-                f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
-                f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
-                f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
-            )
+            lines.append(_row_line(r, i))
 
     return "\n".join(lines)
 
 
-def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], alts: List[Dict]) -> str:
+def _compact_payload(mode: str, risk_pref: Optional[str], majors: List[Dict], alts: List[Dict]) -> str:
     def compact(items):
         out = []
         for r in items:
@@ -238,6 +249,8 @@ def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], al
                 "price": float(r["price"]),
                 "mcap": float(r["market_cap"]),
                 "vol24h": float(r["volume_24h"]),
+                "sources_ok": int(r.get("sources_ok", 0)),
+                "sources_used": r.get("sources_used", ""),
             })
         return out
 
@@ -246,37 +259,39 @@ def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], al
         "risk_pref": risk_pref,
         "no_alts": compact(majors),
         "alts": compact(alts),
-        "rules": {"use_only_payload": True},
+        "rules": {"use_only_payload": True, "no_headlines": True, "no_notes": True},
     }
     return json.dumps(payload, ensure_ascii=False)
 
 
-def llm_render(user_text: str, payload_json: str, fallback_text: str) -> str:
+def _llm_render(user_text: str, payload_json: str, fallback: str) -> str:
     if not OPENAI_API_KEY:
-        return fallback_text
+        return fallback
 
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
-        return fallback_text
+        return fallback
 
     system = (
-        "Sos un analista cripto prudente. Escribís en español rioplatense, claro y conversacional. "
+        "Sos un analista cripto prudente. Español rioplatense, claro y conversacional. "
         "No das asesoramiento financiero. "
-        "No incluyas titulares, RSS, ni notas largas. "
-        "REGLA: solo podés usar datos dentro del JSON. No inventes."
+        "PROHIBIDO: titulares/noticias, notas largas, listas gigantes. "
+        "REGLA: solo podés usar datos del JSON. No inventes."
     )
 
     user = (
-        f"Usuario dijo: {user_text}\n\n"
+        f"Usuario: {user_text}\n\n"
         f"JSON (fuente única):\n{payload_json}\n\n"
-        "Respondé:\n"
-        "- 2-3 líneas de panorama.\n"
-        "- 4 a 8 ideas concretas (mezclá no-alts y alts): por qué entra, riesgo, y qué invalida.\n"
-        "- Si el usuario pidió 'top N', podés listar como máximo 12 items, no más.\n"
-        "- Si falta info, hacé 1 pregunta corta.\n"
-        "- No pegues el listado entero del fallback.\n"
+        "Objetivo: responder como conversación.\n"
+        "Formato:\n"
+        "1) 2-3 líneas de panorama del modo (diario/semanal/mensual).\n"
+        "2) 4 a 8 ideas accionables mezclando NO-ALTS y ALTS (no más de 8).\n"
+        "   - Cada idea: símbolo + por qué puede entrar + riesgo + qué invalida (1 línea cada cosa).\n"
+        "3) Si el pedido fue 'lista' o 'top', entregá un resumen corto y ofrecé: "
+        "   'si querés te paso la lista completa'. No pegues 20 líneas.\n"
+        "4) Si falta info, hacé 1 pregunta corta.\n"
     )
 
     try:
@@ -285,34 +300,28 @@ def llm_render(user_text: str, payload_json: str, fallback_text: str) -> str:
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0.35,
         )
-        out = resp.choices[0].message.content.strip()
-        return out if out else fallback_text
+        out = (resp.choices[0].message.content or "").strip()
+        return out if out else fallback
     except Exception:
-        return fallback_text
+        return fallback
 
 
 def build_engine_analysis(user_text: str) -> str:
     mode = detect_mode(user_text)
     top_n = parse_top_n(user_text, default=20)
     risk_pref = detect_risk_pref(user_text)
+    kind = detect_request_kind(user_text)
     symbol = extract_symbol(user_text)
 
     rows = fetch_top100_market()
 
-    # FILTROS CLAVE: afuera stables y oro
+    # Fuera stables y oro
     rows = [r for r in rows if r.get("symbol") and (not is_stable(r)) and (not is_gold(r))]
 
-    enriched = []
-    for r in rows:
-        rr = dict(r)
-        rr["engine_score"] = compute_engine_score(rr)
-        rr["risk"] = estimate_risk(rr)
-        enriched.append(rr)
+    enriched = _enrich(rows)
 
-    enriched.sort(key=lambda x: x["engine_score"], reverse=True)
-
-    # Si preguntó por símbolo, devolvemos ficha corta (sin confundirse con "PEDIDO", etc.)
-    if symbol and any(k in (user_text or "").lower() for k in ["?", "como", "ves", "hoy", "seman", "mes", "diar"]):
+    # Si pidió símbolo puntual (BTC hoy?, como ves SOL?, etc.)
+    if symbol:
         r = next((x for x in enriched if x["symbol"] == symbol), None)
         if not r:
             return f"No encontré {symbol} en el top 100 actual."
@@ -320,14 +329,25 @@ def build_engine_analysis(user_text: str) -> str:
             f"{r['symbol']} ({r['name']})\n"
             f"precio {price_fmt(r['price'])} | riesgo {r['risk']} | score {r['engine_score']:.1f}\n"
             f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])}\n"
-            f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
+            f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}\n"
+            f"verificación: src_ok {r.get('sources_ok', 0)} ({r.get('sources_used','')})"
         )
 
     top = enriched[:top_n]
     majors, alts = split_alts_and_majors(top)
     majors, alts = pick_balanced(majors, alts, top_n)
 
-    fallback = raw_report(mode, top_n, majors, alts)
-    payload = raw_compact_json(mode, risk_pref, majors, alts)
+    # Fallback “lista completa” (solo si realmente pidió ranking/top/lista)
+    fallback_list = _list_output(mode, top_n, majors, alts)
+    payload = _compact_payload(mode, risk_pref, majors, alts)
 
-    return llm_render(user_text, payload, fallback)
+    if kind == "LIST":
+        # En modo lista: si hay LLM, lo hace “humano”; si no, listamos.
+        return _llm_render(user_text, payload, fallback_list)
+
+    # BRIEF/CHAT: salida conversacional sí o sí (con fallback)
+    fallback_brief = (
+        f"Panorama {mode} | Top {top_n}\n"
+        f"Si querés, pedime 'top {top_n}' y te lo muestro dividido NO-ALTS/ALTS."
+    )
+    return _llm_render(user_text, payload, fallback_brief)
