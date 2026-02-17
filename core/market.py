@@ -1,11 +1,7 @@
-import time
-import requests
+from typing import List, Dict, Tuple
+from core.sources import fetch_coingecko_top100
 
-COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
-HEADERS = {"User-Agent": "OrtelliCryptoAI/1.0"}
-TIMEOUT = 25
-
-# NO-ALTS = majors explícitos + top10 por market cap
+# Lista explícita (además de Top10 por cap) para clasificar como NO-ALTS
 MAJORS_SET = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOGE", "DOT", "TRX", "LINK"}
 
 STABLES = {
@@ -15,32 +11,13 @@ STABLES = {
 
 GOLD = {"XAUT", "PAXG"}
 
-_TTL = 300  # 5 min cache CoinGecko
-_CACHE = {"ts": 0, "rows": None}
 
-
-def fetch_top100_market(vs="usd"):
-    now = time.time()
-    if _CACHE["rows"] is not None and (now - _CACHE["ts"] < _TTL):
-        return _CACHE["rows"]
-
-    params = {
-        "vs_currency": vs,
-        "order": "market_cap_desc",
-        "per_page": 100,
-        "page": 1,
-        "sparkline": "false",
-        "price_change_percentage": "7d,30d",
-    }
-    r = requests.get(COINGECKO_URL, params=params, timeout=TIMEOUT, headers=HEADERS)
-    r.raise_for_status()
-
-    data = r.json()
-    rows = []
+def fetch_top100_market(vs: str = "usd") -> List[Dict]:
+    data = fetch_coingecko_top100(vs=vs)
+    rows: List[Dict] = []
     for idx, coin in enumerate(data, start=1):
         symbol = (coin.get("symbol") or "").upper().strip()
         name = (coin.get("name") or "").strip()
-
         rows.append({
             "rank": idx,
             "id": coin.get("id"),
@@ -52,19 +29,24 @@ def fetch_top100_market(vs="usd"):
             "mom_7d": coin.get("price_change_percentage_7d_in_currency", 0) or 0,
             "mom_30d": coin.get("price_change_percentage_30d_in_currency", 0) or 0,
         })
-
-    _CACHE["ts"] = now
-    _CACHE["rows"] = rows
     return rows
 
 
-def is_stable(row) -> bool:
+def is_gold(row: Dict) -> bool:
+    sym = (row.get("symbol") or "").upper()
+    if sym in GOLD:
+        return True
+    name = (row.get("name") or "").lower()
+    return "gold" in name
+
+
+def is_stable(row: Dict) -> bool:
     sym = (row.get("symbol") or "").upper()
     if sym in STABLES:
         return True
 
     name = (row.get("name") or "").lower()
-    if ("stable" in name) or ("usd" in name and ("coin" in name or "dollar" in name or "stable" in name)):
+    if "stable" in name:
         return True
 
     p = float(row.get("price", 0) or 0)
@@ -76,21 +58,13 @@ def is_stable(row) -> bool:
     return False
 
 
-def is_gold(row) -> bool:
-    sym = (row.get("symbol") or "").upper()
-    if sym in GOLD:
-        return True
-    name = (row.get("name") or "").lower()
-    return "gold" in name
-
-
-def is_major(row) -> bool:
+def is_major(row: Dict) -> bool:
     sym = (row.get("symbol") or "").upper()
     rank = int(row.get("rank", 999) or 999)
     return (sym in MAJORS_SET) or (rank <= 10)
 
 
-def split_alts_and_majors(rows):
+def split_alts_and_majors(rows: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     majors, alts = [], []
     for r in rows:
         if is_major(r):
@@ -100,7 +74,7 @@ def split_alts_and_majors(rows):
     return majors, alts
 
 
-def estimate_risk(row) -> str:
+def estimate_risk(row: Dict) -> str:
     cap = float(row.get("market_cap", 0) or 0)
     if cap >= 200_000_000_000:
         return "LOW"
