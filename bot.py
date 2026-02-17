@@ -2,7 +2,7 @@ import os
 import time
 import math
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 import requests
 import numpy as np
@@ -16,27 +16,34 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN env var. Set it in Railway > Variables.")
 
-# Config (you can override with Railway Variables if you want)
-TIMEFRAME = os.getenv("TIMEFRAME", "1d")          # Binance interval
+# --- Config ---
+TIMEFRAME = os.getenv("TIMEFRAME", "1d")            # used for primary candles
 CANDLE_LIMIT = int(os.getenv("CANDLE_LIMIT", "200"))
 PRICE_GAP_TOL = float(os.getenv("PRICE_GAP_TOL", "0.02"))  # 2%
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+# Primary candles source (reliable on cloud):
+BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
+
+# Secondary price sources (spot):
+KRAKEN_TICKER_URL = "https://api.kraken.com/0/public/Ticker"
+COINBASE_TICKER_URL = "https://api.exchange.coinbase.com/products/{product_id}/ticker"
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
-# (name, binance_symbol, coingecko_id)
-UNIVERSE: List[Tuple[str, str, str]] = [
-    ("Bitcoin", "BTCUSDT", "bitcoin"),
-    ("Ethereum", "ETHUSDT", "ethereum"),
-    ("Solana", "SOLUSDT", "solana"),
-    ("BNB", "BNBUSDT", "binancecoin"),
-    ("XRP", "XRPUSDT", "ripple"),
-    ("Cardano", "ADAUSDT", "cardano"),
-    ("Avalanche", "AVAXUSDT", "avalanche-2"),
-    ("Chainlink", "LINKUSDT", "chainlink"),
+# Universe with per-exchange symbol mapping:
+# name, binance_symbol, kraken_pair, coinbase_product, coingecko_id
+UNIVERSE: List[Tuple[str, str, str, str, str]] = [
+    ("Bitcoin",  "BTCUSDT", "XBTUSD", "BTC-USD", "bitcoin"),
+    ("Ethereum", "ETHUSDT", "ETHUSD", "ETH-USD", "ethereum"),
+    ("Solana",   "SOLUSDT", "SOLUSD", "SOL-USD", "solana"),
+    ("BNB",      "BNBUSDT", "",       "",       "binancecoin"),  # often not on Kraken/Coinbase
+    ("XRP",      "XRPUSDT", "XRPUSD", "XRP-USD", "ripple"),
+    ("Cardano",  "ADAUSDT", "ADAUSD", "ADA-USD", "cardano"),
+    ("Avalanche","AVAXUSDT","AVAXUSD","AVAX-USD","avalanche-2"),
+    ("Chainlink","LINKUSDT","LINKUSD","LINK-USD","chainlink"),
 ]
 
 
+# ---------- Data fetch ----------
 def fetch_binance_closes(symbol: str, interval: str, limit: int) -> Tuple[List[float], Optional[float]]:
     r = requests.get(
         BINANCE_KLINES_URL,
@@ -50,16 +57,44 @@ def fetch_binance_closes(symbol: str, interval: str, limit: int) -> Tuple[List[f
     return closes, last_close
 
 
-def fetch_coingecko_markets(ids: List[str]) -> List[Dict]:
+def fetch_kraken_price(pair: str) -> Optional[float]:
+    if not pair:
+        return None
+    r = requests.get(KRAKEN_TICKER_URL, params={"pair": pair}, timeout=25)
+    r.raise_for_status()
+    j = r.json()
+    result = j.get("result") or {}
+    if not result:
+        return None
+    # Kraken returns dynamic key, take first:
+    key = list(result.keys())[0]
+    last = result[key].get("c", [None])[0]
+    return float(last) if last else None
+
+
+def fetch_coinbase_price(product_id: str) -> Optional[float]:
+    if not product_id:
+        return None
+    url = COINBASE_TICKER_URL.format(product_id=product_id)
+    r = requests.get(url, timeout=25)
+    r.raise_for_status()
+    j = r.json()
+    price = j.get("price")
+    return float(price) if price else None
+
+
+def fetch_coingecko_prices(ids: List[str]) -> Dict[str, Dict]:
     r = requests.get(
         COINGECKO_MARKETS_URL,
         params={"vs_currency": "usd", "ids": ",".join(ids), "per_page": 250, "page": 1},
         timeout=25,
     )
     r.raise_for_status()
-    return r.json()
+    lst = r.json()
+    return {m["id"]: m for m in lst}
 
 
+# ---------- Features / scoring ----------
 def pct_change(a: float, b: float) -> float:
     if a == 0:
         return 0.0
@@ -72,6 +107,7 @@ def features_from_closes(closes: List[float]) -> Dict[str, float]:
 
     c = np.array(closes, dtype=float)
     last = c[-1]
+
     mom_7d = pct_change(c[-8], last)
     mom_30d = pct_change(c[-31], last)
 
@@ -85,7 +121,7 @@ def features_from_closes(closes: List[float]) -> Dict[str, float]:
     return {"mom_7d": float(mom_7d), "mom_30d": float(mom_30d), "vol_30d": float(vol_30d), "dd_30d": float(dd_30d)}
 
 
-def score_asset(feat: Dict[str, float], vol24h_usd: Optional[float], verified: bool) -> Dict[str, object]:
+def score_asset(feat: Dict[str, float], liquidity_usd: Optional[float], verified_sources: int) -> Dict[str, object]:
     mom_7d = feat["mom_7d"]
     mom_30d = feat["mom_30d"]
     vol = feat["vol_30d"]
@@ -97,100 +133,162 @@ def score_asset(feat: Dict[str, float], vol24h_usd: Optional[float], verified: b
     s -= 10.0 * math.tanh(2.0 * vol)
     s -= 12.0 * math.tanh(5.0 * abs(dd))
 
-    if vol24h_usd is None:
-        s -= 8.0
+    # liquidity (use coingecko total_volume as proxy if available)
+    if liquidity_usd is None:
+        s -= 6.0
     else:
-        if vol24h_usd < 10_000_000:
+        if liquidity_usd < 10_000_000:
             s -= 12.0
-        elif vol24h_usd < 50_000_000:
+        elif liquidity_usd < 50_000_000:
             s -= 6.0
-        elif vol24h_usd > 200_000_000:
+        elif liquidity_usd > 200_000_000:
             s += 6.0
 
-    if not verified:
-        s -= 25.0
+    # verification bonus/penalty
+    if verified_sources >= 3:
+        s += 6.0
+    elif verified_sources == 2:
+        s += 2.0
+    else:
+        s -= 18.0
 
     s = float(max(0.0, min(100.0, s)))
 
     risk = "LOW"
-    if vol > 0.9 or (vol24h_usd is not None and vol24h_usd < 10_000_000):
+    if vol > 0.9 or (liquidity_usd is not None and liquidity_usd < 10_000_000):
         risk = "HIGH"
     elif vol > 0.6 or abs(dd) > 0.20:
         risk = "MEDIUM"
 
-    return {"score": s, "risk": risk}
+    # confidence: 0..100
+    confidence = min(100, int(verified_sources * 33))
+
+    return {"score": s, "risk": risk, "confidence": confidence}
 
 
 def fmt_pct(x: float) -> str:
     return f"{x * 100:.2f}%"
 
 
+def within_tol(a: float, b: float, tol: float) -> bool:
+    if a is None or b is None:
+        return False
+    if a == 0:
+        return False
+    return abs(a - b) / a <= tol
+
+
 def build_report(top_n: int = 5) -> str:
-    ids = [cg_id for _, _, cg_id in UNIVERSE]
-    cg_list = fetch_coingecko_markets(ids)
-    cg_map = {m["id"]: m for m in cg_list}
+    ids = [cg_id for _, _, _, _, cg_id in UNIVERSE]
+    cg_map = fetch_coingecko_prices(ids)
 
     rows = []
-    for name, bsymbol, cg_id in UNIVERSE:
-        m = cg_map.get(cg_id, {})
-        cg_price = m.get("current_price")
-        cg_vol = m.get("total_volume")
+    for name, bsymbol, kr_pair, cb_prod, cg_id in UNIVERSE:
+        cg = cg_map.get(cg_id, {})
+        cg_price = cg.get("current_price")
+        cg_vol = cg.get("total_volume")  # liquidity proxy
 
-        verified = True
+        # Primary candles + primary last price
         closes = []
-        last_close = None
-
+        bn_last = None
+        candles_ok = True
         try:
-            closes, last_close = fetch_binance_closes(bsymbol, TIMEFRAME, CANDLE_LIMIT)
+            closes, bn_last = fetch_binance_closes(bsymbol, TIMEFRAME, CANDLE_LIMIT)
         except Exception:
-            verified = False
+            candles_ok = False
 
-        if cg_price and last_close:
-            gap = abs(float(cg_price) - float(last_close)) / float(cg_price)
-            if gap > PRICE_GAP_TOL:
-                verified = False
+        # Secondary sources (last prices)
+        kr_last = None
+        cb_last = None
+        try:
+            kr_last = fetch_kraken_price(kr_pair)
+        except Exception:
+            pass
+        try:
+            cb_last = fetch_coinbase_price(cb_prod)
+        except Exception:
+            pass
 
-        feat = features_from_closes(closes) if closes else {"mom_7d": 0.0, "mom_30d": 0.0, "vol_30d": 0.0, "dd_30d": 0.0}
-        scored = score_asset(feat, vol24h_usd=cg_vol, verified=verified)
+        # Verification: count how many sources agree with primary (bn_last). If bn_last missing, fallback to cg_price.
+        anchor = bn_last if bn_last is not None else (float(cg_price) if cg_price else None)
+
+        sources = []
+        if anchor is not None:
+            sources.append(("binance", bn_last))
+            sources.append(("kraken", kr_last))
+            sources.append(("coinbase", cb_last))
+            sources.append(("coingecko", float(cg_price) if cg_price else None))
+
+        verified_sources = 0
+        used_sources = []
+        if anchor is not None:
+            for label, px in sources:
+                if px is None:
+                    continue
+                if within_tol(anchor, px, PRICE_GAP_TOL):
+                    verified_sources += 1
+                    used_sources.append(label)
+
+        feat = features_from_closes(closes) if (candles_ok and closes) else {"mom_7d": 0.0, "mom_30d": 0.0, "vol_30d": 0.0, "dd_30d": 0.0}
+        scored = score_asset(feat, liquidity_usd=cg_vol, verified_sources=verified_sources)
 
         rows.append({
             "name": name,
             "symbol": bsymbol,
             "score": scored["score"],
             "risk": scored["risk"],
+            "confidence": scored["confidence"],
             "mom_30d": feat["mom_30d"],
-            "vol_30d": feat["vol_30d"],
-            "verified": verified,
+            "mom_7d": feat["mom_7d"],
+            "verified_sources": verified_sources,
+            "used_sources": used_sources,
+            "candles_ok": candles_ok,
         })
 
     rows.sort(key=lambda x: float(x["score"]), reverse=True)
     top = rows[:top_n]
 
+    # Format: more human-friendly
     lines = []
-    lines.append("Crypto Brief (verified)")
-    lines.append(time.strftime("Generated UTC: %Y-%m-%d %H:%M:%S", time.gmtime()))
+    lines.append("MARKET BRIEF (multi-source)")
+    lines.append(time.strftime("UTC %Y-%m-%d %H:%M:%S", time.gmtime()))
     lines.append("")
-    lines.append("Top options (you decide):")
+    lines.append("TOP PICKS (you decide):")
+
     for i, r in enumerate(top, 1):
         lines.append(
-            f"{i}) {r['name']} ({r['symbol']}) | Score {r['score']:.1f} | Risk {r['risk']} | "
-            f"Mom30d {fmt_pct(float(r['mom_30d']))} | Verified {r['verified']}"
+            f"{i}) {r['name']} ({r['symbol']}) | score {r['score']:.1f} | conf {r['confidence']} | risk {r['risk']}"
         )
+        lines.append(
+            f"   mom: 7d {fmt_pct(float(r['mom_7d']))} | 30d {fmt_pct(float(r['mom_30d']))}"
+        )
+        lines.append(
+            f"   sources_ok: {r['verified_sources']} | used: {', '.join(r['used_sources']) if r['used_sources'] else 'none'}"
+        )
+
     lines.append("")
-    lines.append("Verification: Binance klines + CoinGecko markets; if price gap > "
-                 f"{int(PRICE_GAP_TOL * 100)}% then NOT verified and score is penalized.")
-    lines.append("Info only, not financial advice.")
+    lines.append("NOTES:")
+    lines.append(f"- verified_sources counts sources within {int(PRICE_GAP_TOL*100)}% of anchor price.")
+    lines.append("- candles come from Binance Vision (cloud friendly).")
+    lines.append("- info only, not financial advice.")
     return "\n".join(lines)
 
 
+# ---------- Telegram handlers ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Bot is online.\nCommands:\n/start\n/daily\n"
+        "Bot online.\nCommands:\n/start\n/daily\n/sources"
+    )
+
+
+async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Sources:\n- Binance Vision (candles)\n- Kraken (spot last price)\n- Coinbase Exchange (spot last price)\n- CoinGecko (market price/volume)\n"
     )
 
 
 async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Running analysis... (5-15s)")
+    await update.message.reply_text("Running analysis... (5-20s)")
     try:
         text = build_report(top_n=5)
         await update.message.reply_text(text)
@@ -202,6 +300,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("daily", daily_cmd))
+    app.add_handler(CommandHandler("sources", sources_cmd))
     app.run_polling()
 
 
