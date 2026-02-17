@@ -1,45 +1,80 @@
+import time
+import requests
 import xml.etree.ElementTree as ET
 from typing import List, Dict
-import requests
 
+HEADERS = {"User-Agent": "OrtelliCryptoAI/1.0"}
+TIMEOUT = 20
+
+# RSS “seguros” para arrancar (podés cambiar)
 RSS_FEEDS = [
-    ("CoinDesk", "https://feeds.feedburner.com/CoinDesk"),
-    ("Cointelegraph", "https://cointelegraph.com/rss"),
-    ("CryptoPanic", "https://cryptopanic.com/feed/"),
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
 ]
 
-def fetch_rss(url: str, timeout: int = 20) -> str:
-    r = requests.get(url, timeout=timeout)
+_TTL = 600  # 10 min
+_CACHE = {}  # key -> (ts, val)
+
+
+def _cache_get(key: str):
+    item = _CACHE.get(key)
+    if not item:
+        return None
+    ts, val = item
+    if time.time() - ts < _TTL:
+        return val
+    return None
+
+
+def _cache_set(key: str, val):
+    _CACHE[key] = (time.time(), val)
+
+
+def fetch_rss(url: str) -> List[Dict]:
+    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
-    return r.text
 
-def parse_rss(xml_text: str, max_items: int = 5) -> List[Dict]:
-    items: List[Dict] = []
-    root = ET.fromstring(xml_text)
-    channel = root.find("channel")
-    if channel is None:
-        return items
-
-    for it in channel.findall("item")[:max_items]:
+    root = ET.fromstring(r.text)
+    items = []
+    for it in root.findall(".//item"):
         title = (it.findtext("title") or "").strip()
         link = (it.findtext("link") or "").strip()
         pub = (it.findtext("pubDate") or "").strip()
-        if title:
-            items.append({"title": title, "link": link, "pubDate": pub})
+        desc = (it.findtext("description") or "").strip()
+        if title and link:
+            items.append({
+                "title": title,
+                "link": link,
+                "published": pub,
+                "summary": desc,
+                "source": url,
+            })
     return items
 
-def get_news(max_total: int = 8) -> List[Dict]:
-    out: List[Dict] = []
-    per_feed = max(2, max_total // max(1, len(RSS_FEEDS)))
 
-    for source, url in RSS_FEEDS:
+def fetch_news(limit_total: int = 40) -> List[Dict]:
+    key = f"news:{limit_total}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    all_items: List[Dict] = []
+    for feed in RSS_FEEDS:
         try:
-            xml = fetch_rss(url)
-            items = parse_rss(xml, max_items=per_feed)
-            for x in items:
-                x["source"] = source
-                out.append(x)
+            all_items.extend(fetch_rss(feed))
         except Exception:
             continue
 
-    return out[:max_total]
+    # dedupe por link
+    seen = set()
+    out = []
+    for it in all_items:
+        if it["link"] in seen:
+            continue
+        seen.add(it["link"])
+        out.append(it)
+
+    out = out[:limit_total]
+    _cache_set(key, out)
+    return out
