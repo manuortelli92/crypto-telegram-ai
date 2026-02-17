@@ -6,7 +6,12 @@ COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
 MAJORS_SET = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOGE", "DOT", "TRX", "LINK"}
 
 # Stablecoins típicas (símbolos) para filtrar
-STABLES = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "USDS", "FRAX", "LUSD", "PYUSD", "GUSD", "USDP"}
+STABLES = {
+    "USDT","USDC","DAI","TUSD","FDUSD","USDE","USDS","FRAX","LUSD","PYUSD","GUSD","USDP",
+    "USD1","RLUSD","USDG","GHO"
+}
+
+GOLD = {"XAUT", "PAXG"}
 
 def fetch_top100_market(vs="usd"):
     params = {
@@ -39,14 +44,22 @@ def fetch_top100_market(vs="usd"):
         })
     return rows
 
-def is_stable(row) -> bool:
+ddef is_stable(row) -> bool:
     sym = row.get("symbol", "")
     if sym in STABLES:
         return True
-    # heurística extra por nombre
+
     name = (row.get("name") or "").lower()
-    if "usd" in name and ("stable" in name or "dollar" in name):
+    if ("stable" in name) or ("usd" in name and ("coin" in name or "dollar" in name or "stable" in name)):
         return True
+
+    # heurística: precio ~1 y cambios muy chicos -> probablemente stable
+    p = float(row.get("price", 0) or 0)
+    m7 = float(row.get("mom_7d", 0) or 0)
+    m30 = float(row.get("mom_30d", 0) or 0)
+    if 0.985 <= p <= 1.015 and abs(m7) < 1.0 and abs(m30) < 2.0:
+        return True
+
     return False
 
 def is_major(row) -> bool:
@@ -71,3 +84,12 @@ def estimate_risk(row) -> str:
     if cap >= 30_000_000_000:
         return "MEDIUM"
     return "HIGH"
+
+def is_gold(row) -> bool:
+    sym = row.get("symbol", "")
+    if sym in GOLD:
+        return True
+    name = (row.get("name") or "").lower()
+    if "gold" in name:
+        return True
+    return False
