@@ -2,19 +2,15 @@ import os
 import time
 import logging
 from collections import deque
-from typing import Any, Dict, Optional
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.error import Conflict, NetworkError, TimedOut
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from core.memory import load_state, set_chat_id
+from core.memory import load_state, set_chat_id, update_prefs
 from core.learning import register_user_interest
 from core.engine import build_engine_analysis
-
-# Brain conversacional
-from core.brain import add_turn, recent_context_text, apply_patch_to_session
 
 logging.basicConfig(level=logging.INFO)
 
@@ -27,26 +23,8 @@ RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "12"))
 
 SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "9"))
 SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
-SCHEDULE_DOW = os.getenv("SCHEDULE_DOW", "mon")
 
 _user_hits = {}
-
-# Intentamos traer save_state si existe
-try:
-    from core.memory import save_state  # type: ignore
-except Exception:
-    save_state = None  # fallback
-
-
-def _persist_state(state: Dict[str, Any]) -> None:
-    if save_state is None:
-        # No crasheamos: solo no persistimos brain
-        logging.warning("core.memory.save_state() no existe. Brain NO persistente (solo RAM).")
-        return
-    try:
-        save_state(state)  # type: ignore
-    except Exception as e:
-        logging.error("save_state falló: %s", e)
 
 
 def is_owner(update: Update) -> bool:
@@ -68,21 +46,42 @@ def rate_limit_ok(user_id: int) -> bool:
     return True
 
 
-def _enrich_text_with_context(state: Dict[str, Any], chat_id: int, user_text: str) -> str:
-    # Actualiza preferencias del brain en base al mensaje actual
-    brain_prefs = apply_patch_to_session(state, chat_id, user_text)
+def extract_prefs_patch(text: str) -> dict:
+    """
+    Parseo simple en español:
+      - "evita memecoins" / "sin memecoins"
+      - "prefiero SOL ETH"
+      - "evita ADA XRP"
+      - "riesgo bajo/medio/alto"
+    """
+    t = (text or "").lower().strip()
+    patch = {}
 
-    ctx = recent_context_text(state, chat_id, max_turns=6)
+    if any(k in t for k in ["evita memecoins", "sin memecoins", "no memecoins", "no memecoin", "sin memecoin"]):
+        patch["avoid_memecoins"] = True
+    if any(k in t for k in ["permiti memecoins", "permití memecoins", "con memecoins", "habilita memecoins"]):
+        patch["avoid_memecoins"] = False
 
-    enriched = (
-        f"CONTEXTO RECIENTE:\n{ctx}\n\n"
-        f"PEDIDO ACTUAL:\n{user_text}\n\n"
-        f"PARAMETROS:\n"
-        f"mode={brain_prefs.get('mode')} top_n={brain_prefs.get('top_n')} "
-        f"risk_pref={brain_prefs.get('risk_pref')} "
-        f"focus={brain_prefs.get('focus')} avoid={brain_prefs.get('avoid')}"
-    )
-    return enriched
+    if any(k in t for k in ["riesgo bajo", "conservador", "risk low", "low"]):
+        patch["risk"] = "LOW"
+    if any(k in t for k in ["riesgo medio", "medium"]):
+        patch["risk"] = "MEDIUM"
+    if any(k in t for k in ["riesgo alto", "agresivo", "risk high", "high"]):
+        patch["risk"] = "HIGH"
+
+    if "prefiero " in t:
+        part = t.split("prefiero ", 1)[1]
+        coins = part.replace(",", " ").upper().split()
+        patch["focus"] = [c for c in coins if c.isalpha() and 2 <= len(c) <= 6]
+
+    if "evita " in t:
+        part = t.split("evita ", 1)[1]
+        coins = part.replace(",", " ").upper().split()
+        # ojo: si dice "evita memecoins" no lo tratamos como tickers
+        coins = [c for c in coins if c not in {"MEMECOINS", "MEMECOIN"}]
+        patch["avoid"] = [c for c in coins if c.isalpha() and 2 <= len(c) <= 6]
+
+    return patch
 
 
 async def send_weekly(application: Application):
@@ -91,14 +90,8 @@ async def send_weekly(application: Application):
     if not chat_id:
         return
     try:
-        # Usamos brain (si existe) para que el semanal sea coherente
-        enriched = _enrich_text_with_context(state, int(chat_id), "informe semanal")
-        text = build_engine_analysis(enriched)
+        text = build_engine_analysis("informe semanal")
         await application.bot.send_message(chat_id=chat_id, text=text)
-
-        add_turn(state, int(chat_id), "bot", text)
-        _persist_state(state)
-
     except Exception as e:
         logging.error("weekly send failed: %s", e)
 
@@ -108,7 +101,7 @@ async def on_startup(app: Application):
     scheduler.add_job(
         lambda: send_weekly(app),
         "cron",
-        day_of_week=SCHEDULE_DOW,
+        day_of_week="mon",
         hour=SCHEDULE_HOUR,
         minute=SCHEDULE_MINUTE,
         id="weekly_report",
@@ -124,51 +117,41 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = user.id
-    chat_id = int(chat.id)
     text = (update.message.text or "").strip()
 
-    # Rate limit solo usuarios normales
     if not is_owner(update):
         if not rate_limit_ok(uid):
             await update.message.reply_text("Demasiadas solicitudes. Espera 1 minuto.")
             return
 
-    # Aprende de lo que escriben (learning ligero)
     register_user_interest(text)
 
-    # Cargamos estado una vez por mensaje
-    state = load_state()
-
-    # /start como texto normal
     if text == "/start" or text.lower() in ["start", "hola", "buenas", "hey"]:
         await update.message.reply_text(
-            "Escribime normal.\n"
+            "Hablame normal.\n"
             "Ej: 'diario', 'semanal', 'mensual', 'top 30 riesgo medio', 'BTC hoy?'\n"
-            "También podés decir: 'prefiero SOL ETH' o 'evita memecoins'.\n"
+            "Si sos el owner, también podés fijar preferencias:\n"
+            "- 'evita memecoins'\n"
+            "- 'prefiero SOL ETH'\n"
+            "- 'evita ADA XRP'\n"
+            "- 'riesgo bajo/medio/alto'\n"
         )
         if is_owner(update):
-            set_chat_id(chat_id)
+            set_chat_id(int(chat.id))
         return
 
-    # Guardamos chat_id del owner para informes automáticos
     if is_owner(update):
-        set_chat_id(chat_id)
+        set_chat_id(int(chat.id))
+        patch = extract_prefs_patch(text)
+        if patch:
+            prefs = update_prefs(patch)
+            await update.message.reply_text(f"OK. Preferencias guardadas: {prefs}")
+            return
 
-    # Brain: guardamos turno user + persistimos
-    add_turn(state, chat_id, "user", text)
-    _persist_state(state)
-
-    # Respuesta
     await update.message.reply_text("Analizando...")
     try:
-        enriched_text = _enrich_text_with_context(state, chat_id, text)
-        reply = build_engine_analysis(enriched_text)
+        reply = build_engine_analysis(text)
         await update.message.reply_text(reply)
-
-        # Brain: guardamos turno bot + persistimos
-        add_turn(state, chat_id, "bot", reply)
-        _persist_state(state)
-
     except Exception as e:
         await update.message.reply_text(f"Error: {type(e).__name__}: {e}")
 
@@ -180,11 +163,9 @@ def build_app() -> Application:
 
 
 def main():
-    # Loop de resiliencia: si Telegram corta por Conflict o red, reintenta
     while True:
         try:
             app = build_app()
-            # drop_pending_updates evita cola vieja si se reinicia
             app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
             return
 
