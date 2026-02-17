@@ -1,92 +1,111 @@
-import os
-import json
-from typing import Dict
-import requests
+from core.market import (
+    fetch_top100_market,
+    split_alts_and_majors,
+    rank_top
+)
 
-from core.market import get_ranked_market, fmt_pct
-from core.news import get_news
+from core.learning import get_learning_boost
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-def _entry_hint(risk: str, mom7: float, mom30: float) -> str:
-    if mom30 < -0.10 and mom7 > 0:
-        return "Entrada: escalonada (3 compras). Evitar full size."
-    if mom30 < -0.10 and mom7 <= 0:
-        return "Entrada: esperar o DCA chico."
-    if mom30 > 0 and mom7 > 0:
-        return "Entrada: DCA o agregar en confirmacion."
-    if risk == "HIGH":
-        return "Entrada: tamano chico + DCA."
-    return "Entrada: DCA (2-3 compras)."
+# ----------------------------------------------------
+# MODE DETECTION
+# ----------------------------------------------------
 
-def build_structured_brief(prefs: Dict) -> str:
+def detect_mode(text: str):
 
-    mkt = get_ranked_market(prefs)
-    news = get_news(max_total=8)
+    t = (text or "").lower()
+
+    if "mensual" in t:
+        return "MONTHLY"
+
+    if "diario" in t or "hoy" in t:
+        return "DAILY"
+
+    return "WEEKLY"
+
+
+# ----------------------------------------------------
+# STRUCTURE SCORING
+# ----------------------------------------------------
+
+def compute_engine_score(row):
+
+    mom7 = row.get("mom_7d", 0)
+    mom30 = row.get("mom_30d", 0)
+
+    # base estructura
+    base = (mom7 * 0.6) + (mom30 * 0.4)
+
+    # learning adaptativo
+    learn = get_learning_boost(row["symbol"])
+
+    # estabilidad (evita pumps falsos)
+    stability = 0
+    if mom7 > 0 and mom30 > 0:
+        stability = 5
+    elif mom7 > 0 and mom30 < 0:
+        stability = -3
+
+    return base + stability + learn
+
+
+# ----------------------------------------------------
+# BUILD ANALYSIS
+# ----------------------------------------------------
+
+def build_engine_analysis(user_text: str):
+
+    mode = detect_mode(user_text)
+
+    market_rows = fetch_top100_market()
+
+    enriched = []
+
+    for r in market_rows:
+
+        score = compute_engine_score(r)
+
+        new_row = dict(r)
+        new_row["engine_score"] = score
+
+        enriched.append(new_row)
+
+    # ranking final TOP 20
+    ranked = sorted(
+        enriched,
+        key=lambda x: x["engine_score"],
+        reverse=True
+    )[:20]
+
+    majors, alts = split_alts_and_majors(ranked)
+
+    return format_report(mode, majors, alts)
+
+
+# ----------------------------------------------------
+# REPORT FORMATTER (LIMPIO)
+# ----------------------------------------------------
+
+def format_report(mode, majors, alts):
 
     lines = []
 
-    lines.append("WEEKLY BRIEF")
-    lines.append(f"UTC {mkt['generated_utc']}")
-    lines.append("")
+    lines.append(f"Panorama {mode}")
 
-    top = mkt.get("top", [])[: int(prefs.get("max_picks") or 3)]
-
-    for i, r in enumerate(top, 1):
-        lines.append(f"{i}) {r['name']} ({r['symbol']})")
-        lines.append(f"Score {r['score']:.1f} | Risk {r['risk']} | Conf {r['confidence']}")
-        lines.append(f"Mom 7d {fmt_pct(r['mom_7d'])} | 30d {fmt_pct(r['mom_30d'])}")
-        lines.append(_entry_hint(r['risk'], r['mom_7d'], r['mom_30d']))
+    if majors:
         lines.append("")
+        lines.append("NO-ALTS")
+        for i, r in enumerate(majors, 1):
+            lines.append(
+                f"{i}) {r['symbol']} | score {round(r['engine_score'],1)} | riesgo {r['risk']} | 7d {r['mom_7d']}"
+            )
 
-    if news:
-        lines.append("Noticias:")
-        for n in news[:5]:
-            lines.append(f"- [{n.get('source')}] {n.get('title')}")
+    if alts:
+        lines.append("")
+        lines.append("ALTS")
+        for i, r in enumerate(alts, 1):
+            lines.append(
+                f"{i}) {r['symbol']} | score {round(r['engine_score'],1)} | riesgo {r['risk']} | 7d {r['mom_7d']}"
+            )
 
     return "\n".join(lines)
-
-def openai_chat(system: str, user: str) -> str:
-
-    url = "https://api.openai.com/v1/chat/completions"
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        "temperature": 0.4
-    }
-
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=45)
-    r.raise_for_status()
-    j = r.json()
-
-    return j["choices"][0]["message"]["content"]
-
-def build_ai_brief(prefs: Dict, user_message: str = "") -> str:
-
-    structured = build_structured_brief(prefs)
-
-    if not OPENAI_API_KEY:
-        return structured
-
-    system = (
-        "Sos un analista crypto que habla SIEMPRE en espanol. "
-        "Das opciones, no ordenes."
-    )
-
-    user = (
-        f"Preferencias: {prefs}\n"
-        f"Mensaje usuario: {user_message}\n\n"
-        f"Brief base:\n{structured}"
-    )
-
-    return openai_chat(system, user)
