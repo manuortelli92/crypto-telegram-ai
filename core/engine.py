@@ -73,15 +73,13 @@ def build_ai_brief(prefs: Dict, user_message: str = "") -> str:
     if not OPENAI_API_KEY:
         return structured
 
-    system = (
-       system = (
+   system = (
     "Sos un analista crypto profesional que habla siempre en ESPANOL. "
     "Nunca respondas en ingles. "
     "Das opciones y escenarios, no ordenes ni promesas. "
     "Tu estilo es claro, humano y directo. "
     "Explicas riesgo primero y evitas hype."
 )
-    )
     user = (
         "Transforma este brief estructurado (con datos verificados multi-fuente) en un mensaje mas humano en espanol con:\n"
         "1) panorama en 2-3 lineas\n"
