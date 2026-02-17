@@ -1,5 +1,6 @@
 import os
 import json
+import math
 from typing import List, Dict, Optional
 
 from core.market import (
@@ -22,6 +23,7 @@ def pct(x: float) -> str:
     except Exception:
         return "n/a"
 
+
 def price_fmt(p: float) -> str:
     try:
         p = float(p)
@@ -34,6 +36,7 @@ def price_fmt(p: float) -> str:
         return f"${p:.6f}"
     except Exception:
         return "n/a"
+
 
 def money(x: float) -> str:
     try:
@@ -63,6 +66,7 @@ def detect_mode(text: str) -> str:
         return "SEMANAL"
     return "SEMANAL"
 
+
 def parse_top_n(text: str, default: int = 20) -> int:
     t = (text or "").lower()
     for tok in t.replace(",", " ").split():
@@ -75,6 +79,7 @@ def parse_top_n(text: str, default: int = 20) -> int:
         return 20
     return default
 
+
 def detect_risk_pref(text: str) -> Optional[str]:
     t = (text or "").lower()
     if any(k in t for k in ["bajo", "conserv", "low"]):
@@ -85,6 +90,7 @@ def detect_risk_pref(text: str) -> Optional[str]:
         return "HIGH"
     return None
 
+
 def extract_symbol(text: str) -> Optional[str]:
     if not text:
         return None
@@ -92,72 +98,87 @@ def extract_symbol(text: str) -> Optional[str]:
     stop = {"HOLA", "HOY", "INFO", "TOP", "DAME", "QUIERO", "RIESGO", "SEMANAL", "DIARIO", "MENSUAL", "INFORME"}
     for tok in tokens:
         up = tok.upper().strip()
-        if 2 <= len(up) <= 6 and up.isalpha() and up not in stop:
+        if 2 <= len(up) <= 10 and up.replace("_", "").isalpha() and up not in stop:
             return up
     return None
 
 
-# --------------------- FILTROS EXTRA (RWA/FUNDS) ---------------------
+# --------------------- FILTRO RWA/FUNDS ---------------------
 
 FUND_WORDS = [
-    "treasury", "fund", "anemoy", "superstate", "government securities", "clo", "t-bill", "bill",
-    "janus henderson", "short duration", "ustb"
+    "treasury", "fund", "anemoy", "superstate", "government securities", "clo",
+    "t-bill", "bill", "janus henderson", "short duration", "ustb",
+    "heloc", "figure", "tokenized", "rwa", "bond", "bonds", "yield", "credit"
 ]
+
 
 def is_fund_like(row: Dict) -> bool:
     name = (row.get("name") or "").lower()
-    sym = (row.get("symbol") or "").lower()
+    sym = (row.get("symbol") or "").upper()
+
+    # símbolos tipo FIGR_HELOC suelen ser RWAs/listados raros
+    if "_" in sym:
+        return True
+
     if any(w in name for w in FUND_WORDS):
         return True
-    if any(w in sym for w in ["jtrsy", "jaaa", "ustb"]):
+
+    # algunos símbolos conocidos (por si cambian nombres)
+    sym_l = sym.lower()
+    if any(s in sym_l for s in ["jtrsy", "jaaa", "ustb"]):
         return True
+
     return False
 
 
-# --------------------- SCORE ---------------------
+# --------------------- SCORE MEJORADO ---------------------
 
 def compute_engine_score(row: Dict) -> float:
     mom7 = float(row.get("mom_7d", 0) or 0)
     mom30 = float(row.get("mom_30d", 0) or 0)
 
-    base = (mom7 * 0.65) + (mom30 * 0.35)
+    cap = float(row.get("market_cap", 0) or 0)
+    vol = float(row.get("volume_24h", 0) or 0)
 
-    consistency = 0.0
-    if mom7 > 0 and mom30 > 0:
-        consistency = 6.0
-    elif mom7 < 0 and mom30 < 0:
-        consistency = -4.0
-    elif mom7 > 0 and mom30 < 0:
-        consistency = -2.0
+    base = (mom7 * 0.55) + (mom30 * 0.45)
 
     dd_penalty = 0.0
     if mom30 < -50:
         dd_penalty = -10.0
     elif mom30 < -30:
-        dd_penalty = -5.0
+        dd_penalty = -6.0
+    elif mom30 < -20:
+        dd_penalty = -3.0
 
-    cap = float(row.get("market_cap", 0) or 0)
-    vol = float(row.get("volume_24h", 0) or 0)
     liq = 0.0
     if cap > 0:
         ratio = vol / cap
-        liq = min(ratio * 150.0, 8.0)
+        liq = min(ratio * 120.0, 8.0)
+
+    quality = 0.0
+    if cap > 0:
+        quality = min(max(math.log10(cap) - 8.5, 0.0) * 2.0, 10.0)
+
+    anti_pump = 0.0
+    if cap > 0 and cap < 1_000_000_000 and mom7 > 20:
+        anti_pump = -8.0
+    elif cap > 0 and cap < 3_000_000_000 and mom7 > 30:
+        anti_pump = -6.0
 
     learn = float(get_learning_boost(row.get("symbol", "")) or 0)
 
-    return base + consistency + dd_penalty + liq + learn
+    return base + dd_penalty + liq + quality + anti_pump + learn
 
 
-# --------------------- SELECCIÓN BALANCEADA REAL ---------------------
+# --------------------- SELECCIÓN BALANCEADA ---------------------
 
 def pick_balanced_ranked(majors_ranked: List[Dict], alts_ranked: List[Dict], total: int):
-    m_target = max(5, min(10, round(total * 0.40)))  # un poco más de majors
+    m_target = max(5, min(10, round(total * 0.40)))
     a_target = total - m_target
 
     majors_sel = majors_ranked[:m_target]
     alts_sel = alts_ranked[:a_target]
 
-    # completar si falta alguno
     if len(majors_sel) < m_target:
         need = m_target - len(majors_sel)
         alts_sel = (alts_sel + alts_ranked[a_target:a_target + need])[:total]
@@ -261,6 +282,8 @@ def llm_render(user_text: str, payload_json: str, fallback_text: str) -> str:
         return fallback_text
 
 
+# --------------------- ENTRYPOINT ---------------------
+
 def build_engine_analysis(user_text: str) -> str:
     mode = detect_mode(user_text)
     top_n = parse_top_n(user_text, default=20)
@@ -269,10 +292,12 @@ def build_engine_analysis(user_text: str) -> str:
 
     rows = fetch_top100_market()
 
-    # filtros: stables, oro, y funds/treasuries tokenizados
     rows = [
         r for r in rows
-        if r.get("symbol") and (not is_stable(r)) and (not is_gold(r)) and (not is_fund_like(r))
+        if r.get("symbol")
+        and (not is_stable(r))
+        and (not is_gold(r))
+        and (not is_fund_like(r))
     ]
 
     enriched = []
@@ -282,10 +307,9 @@ def build_engine_analysis(user_text: str) -> str:
         rr["risk"] = estimate_risk(rr)
         enriched.append(rr)
 
-    # ficha corta: solo si mensaje corto y no pide informe
     t = (user_text or "").lower()
     if symbol and ("informe" not in t) and (len((user_text or "").split()) <= 6):
-        r = next((x for x in enriched if x.get("symbol") == symbol), None)
+        r = next((x for x in enriched if (x.get("symbol") or "").upper() == symbol.upper()), None)
         if not r:
             return f"No encontré {symbol} en el top 100 actual."
         return (
@@ -295,7 +319,6 @@ def build_engine_analysis(user_text: str) -> str:
             f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
         )
 
-    # Ranking separado: majors y alts (así NO-ALTS no depende del top score)
     majors_all, alts_all = split_alts_and_majors(enriched)
 
     majors_ranked = sorted(majors_all, key=lambda x: x["engine_score"], reverse=True)
