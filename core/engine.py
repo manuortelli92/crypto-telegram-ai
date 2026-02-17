@@ -16,13 +16,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 def pct(x: float) -> str:
     try:
-        return f"{x:+.2f}%"
+        return f"{float(x):+.2f}%"
     except Exception:
         return "n/a"
 
 
 def price_fmt(p: float) -> str:
     try:
+        p = float(p)
         if p >= 1000:
             return f"${p:,.0f}"
         if p >= 1:
@@ -36,6 +37,7 @@ def price_fmt(p: float) -> str:
 
 def money(x: float) -> str:
     try:
+        x = float(x)
         if x >= 1_000_000_000_000:
             return f"${x/1_000_000_000_000:.2f}T"
         if x >= 1_000_000_000:
@@ -51,11 +53,11 @@ def money(x: float) -> str:
 
 def detect_mode(text: str) -> str:
     t = (text or "").lower()
-    if any(k in t for k in ["mensual", "mes"]):
+    if "mensual" in t or "mes" in t:
         return "MENSUAL"
-    if any(k in t for k in ["diario", "hoy", "24h"]):
+    if "diario" in t or "hoy" in t or "24h" in t:
         return "DIARIO"
-    if any(k in t for k in ["semanal", "semana", "7d"]):
+    if "semanal" in t or "semana" in t or "7d" in t:
         return "SEMANAL"
     return "SEMANAL"
 
@@ -88,11 +90,10 @@ def extract_symbol(text: str) -> Optional[str]:
     if not text:
         return None
     tokens = text.replace(",", " ").replace("?", " ").replace("!", " ").split()
+    stop = {"HOLA", "HOY", "INFO", "TOP", "DAME", "QUIERO", "RIESGO", "SEMANAL", "DIARIO", "MENSUAL", "INFORME"}
     for tok in tokens:
         up = tok.upper().strip()
-        if 2 <= len(up) <= 6 and up.isalpha():
-            if up in {"HOLA", "HOY", "INFO", "TOP", "DAME", "QUIERO", "RIESGO", "SEMANAL", "DIARIO", "MENSUAL"}:
-                continue
+        if 2 <= len(up) <= 6 and up.isalpha() and up not in stop:
             return up
     return None
 
@@ -124,18 +125,20 @@ def compute_engine_score(row: Dict) -> float:
         ratio = vol / cap
         liq = min(ratio * 150.0, 8.0)
 
-    learn = float(get_learning_boost(row["symbol"]) or 0)
+    learn = float(get_learning_boost(row.get("symbol", "")) or 0)
 
     return base + consistency + dd_penalty + liq + learn
 
 
 def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
+    # objetivo: SIEMPRE tener NO-ALTS visible
     m_target = max(4, min(10, round(total * 0.35)))
     a_target = total - m_target
 
     majors_sel = majors[:m_target]
     alts_sel = alts[:a_target]
 
+    # fallback si falta alguno
     if len(majors_sel) < m_target:
         need = m_target - len(majors_sel)
         alts_sel = (alts_sel + alts[a_target:a_target + need])[:total]
@@ -143,6 +146,10 @@ def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
     if len(alts_sel) < a_target:
         need = a_target - len(alts_sel)
         majors_sel = (majors_sel + majors[m_target:m_target + need])[:total]
+
+    # última red de seguridad: si NO-ALTS quedó vacío, robamos del top global
+    if not majors_sel and majors:
+        majors_sel = majors[:max(1, min(5, len(majors)))]
 
     return majors_sel, alts_sel
 
@@ -153,21 +160,27 @@ def raw_report(mode: str, top_n: int, majors: List[Dict], alts: List[Dict]) -> s
 
     lines.append("")
     lines.append("NO-ALTS")
-    for i, r in enumerate(majors, 1):
-        lines.append(
-            f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
-            f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
-            f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
-        )
+    if not majors:
+        lines.append("(sin resultados en NO-ALTS con los filtros actuales)")
+    else:
+        for i, r in enumerate(majors, 1):
+            lines.append(
+                f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
+                f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
+                f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
+            )
 
     lines.append("")
     lines.append("ALTS")
-    for i, r in enumerate(alts, 1):
-        lines.append(
-            f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
-            f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
-            f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
-        )
+    if not alts:
+        lines.append("(sin resultados en ALTS con los filtros actuales)")
+    else:
+        for i, r in enumerate(alts, 1):
+            lines.append(
+                f"{i}) {r['symbol']} ({r['name']}) | score {r['engine_score']:.1f} | riesgo {r['risk']} | "
+                f"7d {pct(r['mom_7d'])} | 30d {pct(r['mom_30d'])} | precio {price_fmt(r['price'])} | "
+                f"mcap {money(r['market_cap'])} | vol24h {money(r['volume_24h'])}"
+            )
 
     return "\n".join(lines)
 
@@ -177,15 +190,15 @@ def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], al
         out = []
         for r in items:
             out.append({
-                "symbol": r["symbol"],
-                "name": r["name"],
-                "score": round(float(r["engine_score"]), 1),
-                "risk": r["risk"],
-                "mom7": round(float(r["mom_7d"]), 2),
-                "mom30": round(float(r["mom_30d"]), 2),
-                "price": float(r["price"]),
-                "mcap": float(r["market_cap"]),
-                "vol24h": float(r["volume_24h"]),
+                "symbol": r.get("symbol"),
+                "name": r.get("name"),
+                "score": round(float(r.get("engine_score", 0)), 1),
+                "risk": r.get("risk"),
+                "mom7": round(float(r.get("mom_7d", 0)), 2),
+                "mom30": round(float(r.get("mom_30d", 0)), 2),
+                "price": float(r.get("price", 0)),
+                "mcap": float(r.get("market_cap", 0)),
+                "vol24h": float(r.get("volume_24h", 0)),
             })
         return out
 
@@ -245,7 +258,7 @@ def build_engine_analysis(user_text: str) -> str:
 
     rows = fetch_top100_market()
 
-    # FILTROS CLAVE: afuera stables y oro
+    # filtros: afuera stables y oro
     rows = [
         r for r in rows
         if r.get("symbol") and (not is_stable(r)) and (not is_gold(r))
@@ -260,9 +273,10 @@ def build_engine_analysis(user_text: str) -> str:
 
     enriched.sort(key=lambda x: x["engine_score"], reverse=True)
 
-    # Si pregunta por símbolo, devolvemos ficha corta (datos directos)
-    if symbol and any(k in (user_text or "").lower() for k in ["?", "como", "ves", "hoy", "seman", "mes"]):
-        r = next((x for x in enriched if x["symbol"] == symbol), None)
+    # ficha corta solo si el mensaje es corto y no pide informe
+    t = (user_text or "").lower()
+    if symbol and ("informe" not in t) and (len((user_text or "").split()) <= 6):
+        r = next((x for x in enriched if x.get("symbol") == symbol), None)
         if not r:
             return f"No encontré {symbol} en el top 100 actual."
         return (
