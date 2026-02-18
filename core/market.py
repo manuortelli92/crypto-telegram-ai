@@ -1,12 +1,12 @@
 import logging
 from typing import List, Dict, Tuple
 
-# Importamos la fuerza bruta desde sources
+# IMPORTANTE: Re-exportamos la función desde sources para que el engine la encuentre aquí
 from core.sources import fetch_coingecko_top100, verify_price_multi_source
 
 logger = logging.getLogger(__name__)
 
-# Listas negras para no recomendar cosas que no son inversión
+# Configuración de activos
 STABLES = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "USDS", "PYUSD"}
 GOLD = {"XAUT", "PAXG"}
 MAJORS = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX"}
@@ -37,19 +37,18 @@ def split_alts_and_majors(rows: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
 
 def verify_prices(rows: List[Dict]) -> Tuple[List[Dict], Dict]:
     """
-    Esta es la función que el engine busca. 
-    Enriquece cada moneda con la verificación multi-fuente.
+    Función que el engine llama para validar precios.
     """
     enriched = []
     verified_count = 0
     
     for r in rows:
-        # Usamos la función de sources.py
+        # Llamamos a la lógica de fuentes que definimos en sources.py
         ok_count, sources_str = verify_price_multi_source(r["price"], r["symbol"])
         
         rr = dict(r)
         rr["verified"] = ok_count >= 2
-        rr["price_anchor"] = r["price"] # En esta versión usamos el de CG como base
+        rr["price_anchor"] = r["price"] 
         rr["sources_ok"] = ok_count
         enriched.append(rr)
         
