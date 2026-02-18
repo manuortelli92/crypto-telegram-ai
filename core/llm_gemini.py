@@ -2,75 +2,60 @@ import os
 import logging
 import google.generativeai as genai
 
-# Configuración Global de Logging
-logging.basicConfig(level=logging.INFO)
+# Configuración de Logging
 logger = logging.getLogger(__name__)
 
-# Cargar y Validar API Key Globalmente
+# La configuración de la API se hace una sola vez al cargar el módulo
 API_KEY = os.getenv("GEMINI_API_KEY")
-if not API_KEY:
-    raise ValueError("❌ Error: No hay clave API configurada. Configura GEMINI_API_KEY en tu entorno.")
+if API_KEY:
+    genai.configure(api_key=API_KEY)
 
-# Configurar la Clase para Manejar el Modelo Centralizadamente
-class GeminiAI:
-    def __init__(self, model_name: str = 'gemini-1.5-flash'):
-        """Inicializa la configuración de la API y el modelo."""
-        self.model_name = model_name
-        self.model = None
-        self.safety_settings = self._configure_safety_settings()
-        self._initialize_model()
+def gemini_render(system_prompt: str, user_prompt: str) -> str:
+    """
+    Versión ultra-compatible para Tier Gratuito.
+    Evita el Error 404 al no usar system_instruction como parámetro separado.
+    """
+    if not API_KEY:
+        logger.error("❌ GEMINI_API_KEY no encontrada.")
+        return "⚠️ Error: Configura la API KEY en Railway."
 
-    def _initialize_model(self):
-        """Configura el modelo generativo una sola vez."""
-        genai.configure(api_key=API_KEY)
-        self.model = genai.GenerativeModel(
-            model_name=self.model_name,
-            system_instruction=""
-        )
-        logger.info(f"Modelo {self.model_name} inicializado con éxito.")
+    try:
+        # 1. Instanciamos el modelo sin system_instruction fija
+        model = genai.GenerativeModel('gemini-1.5-flash')
 
-    def _configure_safety_settings(self):
-        """Define los ajustes de seguridad del modelo."""
-        return [
+        # 2. UNIFICACIÓN DE PROMPT (Clave para el Plan Gratis)
+        # En lugar de separar los roles, los enviamos en un solo bloque.
+        # Esto es lo más compatible con todas las versiones de la API.
+        prompt_final = f"INSTRUCCIONES DE SISTEMA:\n{system_prompt}\n\nCONSULTA DEL USUARIO:\n{user_prompt}"
+
+        # 3. Ajustes de seguridad (para evitar bloqueos por data financiera)
+        safety = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
         ]
 
-    def generate_response(self, system_prompt: str, user_prompt: str) -> str:
-        """Genera contenido basado en las instrucciones proporcionadas."""
-        try:
-            self.model.system_instruction = system_prompt
-            response = self.model.generate_content(
-                user_prompt,
-                safety_settings=self.safety_settings
-            )
+        # 4. Generación de contenido
+        response = model.generate_content(
+            prompt_final,
+            safety_settings=safety
+        )
 
-            # Manejo de Respuestas de Google AI
-            if response.candidates and response.candidates[0].finish_reason == 3:
-                return "⚠️ Google bloqueó esta respuesta por sus políticas de seguridad."
-            if response and response.text:
-                return response.text
-            return "⚠️ Google devolvió una respuesta vacía. Intenta reformular tu pregunta."
+        if response and response.text:
+            return response.text
+        
+        return "⚠️ Google devolvió una respuesta vacía o bloqueada."
 
-        except Exception as e:
-            return self._handle_error(e)
-
-    def _handle_error(self, error: Exception) -> str:
-        """Gestión y registro de excepciones."""
-        error_msg = str(error)
-        logger.error(f"💥 Error: {error_msg}")
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"💥 Error en Gemini: {error_msg}")
 
         if "429" in error_msg:
-            return "🚀 ¡Calma! Mandaste demasiados mensajes seguidos. Espera un momento."
+            return "🚀 Cuota agotada por este minuto. Esperá un momento."
+        if "404" in error_msg:
+            return "📍 Error 404: Nombre de modelo no reconocido o no disponible en esta región."
         if "location" in error_msg.lower():
-            return "📍 Error de ubicación. Asegúrate de que Railway esté configurado en us-east-1."
-        return f"🤯 Explotó algo internamente: {error_msg}"
-
-
-# Uso Ejemplo - Entrada
-def gemini_render(system_prompt: str, user_prompt: str) -> str:
-    """Interfaz simplificada para interactuar con GeminiAI."""
-    gemini = GeminiAI()
-    return gemini.generate_response(system_prompt, user_prompt)
+            return "📍 Tu servidor de Railway está en una región no soportada por el Plan Gratis."
+            
+        return f"🤯 Error técnico: {error_msg}"
