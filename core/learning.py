@@ -99,3 +99,17 @@ def get_learning_boost(symbol: str) -> float:
     import math
     boost = math.log10(interest_count + 1) * 3 
     return min(boost, 10.0)
+    
+    def apply_patch_to_session(state: dict, chat_id: int, patch: dict):
+    """Función puente para compatibilidad con el engine."""
+    # Si el patch tiene preferencias, las actualizamos
+    if "prefs" in patch:
+        update_prefs(patch["prefs"])
+    
+    # Si el patch tiene datos de sesión (brain), los guardamos
+    if "brain" in patch:
+        if "brain" not in state: state["brain"] = {"sessions": {}}
+        state["brain"]["sessions"][str(chat_id)] = patch["brain"]
+    
+    save_state(state)
+
