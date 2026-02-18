@@ -10,8 +10,7 @@ from core.market import (
     is_gold,
 )
 from core.learning import get_learning_boost
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+from core.llm_gemini import gemini_render
 
 
 def pct(x: float) -> str:
@@ -64,7 +63,6 @@ def detect_mode(text: str) -> str:
 
 def parse_top_n(text: str, default: int = 20) -> int:
     t = (text or "").lower()
-    # acepta "top 30", "top 25", o un número suelto
     if "top" in t:
         parts = t.replace(",", " ").split()
         for i, w in enumerate(parts):
@@ -167,19 +165,10 @@ def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], al
 
 
 def llm_render(user_text: str, payload_json: str, fallback_text: str) -> str:
-    if not OPENAI_API_KEY:
-        return fallback_text
-
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception:
-        return fallback_text
-
     system = (
         "Sos un analista cripto prudente. Español rioplatense, claro y conversacional. "
         "No das asesoramiento financiero. No uses titulares ni 'notas' largas. "
-        "Regla: solo podés usar datos dentro del JSON; no inventes."
+        "Regla estricta: solo podés usar datos dentro del JSON; no inventes."
     )
 
     user = (
@@ -192,16 +181,8 @@ def llm_render(user_text: str, payload_json: str, fallback_text: str) -> str:
         "Prohibido: listar top completo, titulares, notas largas.\n"
     )
 
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.35,
-        )
-        out = resp.choices[0].message.content.strip()
-        return out if out else fallback_text
-    except Exception:
-        return fallback_text
+    out = gemini_render(system, user)
+    return out if out else fallback_text
 
 
 def _extract_symbol_strict(user_text: str, known_symbols: set) -> Optional[str]:
@@ -238,7 +219,6 @@ def build_engine_analysis(user_text: str) -> str:
     rows = [r for r in rows if r.get("symbol") and (not is_stable(r)) and (not is_gold(r))]
 
     known = {r["symbol"] for r in rows if r.get("symbol")}
-
     symbol = _extract_symbol_strict(user_text, known)
 
     enriched = []
@@ -266,12 +246,12 @@ def build_engine_analysis(user_text: str) -> str:
     majors, alts = split_alts_and_majors(top)
     majors, alts = pick_balanced(majors, alts, top_n)
 
-    # fallback corto (si no hay LLM)
+    # fallback corto (si no hay Gemini o falla)
     fallback = (
         f"Panorama {mode} | Top {top_n}\n\n"
         f"NO-ALTS: {', '.join([x['symbol'] for x in majors[:8]])}\n"
         f"ALTS: {', '.join([x['symbol'] for x in alts[:12]])}\n"
-        "Si querés, pedime: 'dame detalles de SOL' o 'top 30 riesgo medio'."
+        "Si querés: 'dame detalles de SOL' o 'top 30 riesgo medio'."
     )
 
     payload = raw_compact_json(mode, risk_pref, majors, alts)
