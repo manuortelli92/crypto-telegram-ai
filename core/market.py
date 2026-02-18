@@ -1,42 +1,47 @@
 import json
 import time
 import requests
+import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
-CACHE_FILE = "/tmp/markets_top100.json"
-CACHE_TTL_SEC = 300  # 5 minutos (baja muchísimo el 429)
+# En Railway, /tmp es un buen lugar para cache temporal, 
+# pero usamos una ruta configurable por si acaso.
+CACHE_FILE = os.getenv("MARKET_CACHE_PATH", "/tmp/markets_top100.json")
+CACHE_TTL_SEC = 300  # 5 minutos
 
 MAJORS_SET = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOGE", "DOT", "TRX", "LINK"}
 
 STABLES = {
     "USDT","USDC","DAI","TUSD","FDUSD","USDE","USDS","FRAX","LUSD","PYUSD","GUSD","USDP",
-    "USD1","RLUSD","USDG","GHO"
+    "USD1","RLUSD","USDG","GHO", "PYUSD"
 }
 
 GOLD = {"XAUT", "PAXG"}
 
-
 def _read_cache():
+    if not os.path.exists(CACHE_FILE):
+        return None
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj
-    except Exception:
+            return json.load(f)
+    except Exception as e:
+        logger.debug(f"Error leyendo cache de mercado: {e}")
         return None
-
 
 def _write_cache(rows):
     try:
         obj = {"ts": int(time.time()), "rows": rows}
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False)
-    except Exception:
-        pass
-
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"No se pudo escribir cache de mercado: {e}")
 
 def fetch_top100_market(vs="usd"):
-    # 1) cache fresco
+    # 1) Intentar usar cache fresco
     cached = _read_cache()
     if cached and (time.time() - cached.get("ts", 0) <= CACHE_TTL_SEC):
         return cached.get("rows", [])
@@ -50,32 +55,36 @@ def fetch_top100_market(vs="usd"):
         "price_change_percentage": "7d,30d",
     }
 
-    # 2) retry/backoff para 429/5xx
+    # 2) Petición con reintentos (Exponential Backoff)
     last_err = None
     for attempt in range(5):
         try:
-            r = requests.get(COINGECKO_URL, params=params, timeout=25)
+            # CoinGecko a veces tarda, subimos un poco el timeout
+            r = requests.get(COINGECKO_URL, params=params, timeout=30)
+            
             if r.status_code == 429:
-                # backoff progresivo
-                time.sleep(2 + attempt * 2)
+                wait = 5 + (attempt * 10) # CoinGecko es muy estricto con el 429
+                logger.warning(f"429 Too Many Requests en CoinGecko. Esperando {wait}s...")
+                time.sleep(wait)
                 continue
+                
             r.raise_for_status()
             data = r.json()
 
             rows = []
             for idx, coin in enumerate(data, start=1):
                 symbol = (coin.get("symbol") or "").upper().strip()
-                name = (coin.get("name") or "").strip()
+                # Limpieza de datos nulos para evitar errores en el Engine
                 rows.append({
                     "rank": idx,
                     "id": coin.get("id"),
                     "symbol": symbol,
-                    "name": name,
-                    "price": coin.get("current_price", 0) or 0,
-                    "market_cap": coin.get("market_cap", 0) or 0,
-                    "volume_24h": coin.get("total_volume", 0) or 0,
-                    "mom_7d": coin.get("price_change_percentage_7d_in_currency", 0) or 0,
-                    "mom_30d": coin.get("price_change_percentage_30d_in_currency", 0) or 0,
+                    "name": (coin.get("name") or "Unknown").strip(),
+                    "price": float(coin.get("current_price") or 0),
+                    "market_cap": float(coin.get("market_cap") or 0),
+                    "volume_24h": float(coin.get("total_volume") or 0),
+                    "mom_7d": float(coin.get("price_change_percentage_7d_in_currency") or 0),
+                    "mom_30d": float(coin.get("price_change_percentage_30d_in_currency") or 0),
                 })
 
             _write_cache(rows)
@@ -83,59 +92,56 @@ def fetch_top100_market(vs="usd"):
 
         except Exception as e:
             last_err = e
-            time.sleep(1 + attempt)
+            logger.error(f"Error en intento {attempt+1} de CoinGecko: {e}")
+            time.sleep(2 ** attempt) # Espera 1, 2, 4, 8 segundos
 
-    # 3) fallback a cache viejo si existe (aunque esté pasado)
-    cached = _read_cache()
+    # 3) Fallback: Si la API falla pero tenemos cache viejo, lo usamos igual
     if cached and cached.get("rows"):
+        logger.warning("Usando cache expirado como fallback por error en API.")
         return cached["rows"]
 
-    raise last_err if last_err else RuntimeError("No se pudo obtener Top100 (sin cache).")
-
+    raise last_err if last_err else RuntimeError("Fallo total al conectar con la API de mercado.")
 
 def is_stable(row) -> bool:
     sym = (row.get("symbol") or "").upper().strip()
-    if sym in STABLES:
-        return True
+    if sym in STABLES: return True
 
     name = (row.get("name") or "").lower()
-    if ("stable" in name) or ("usd" in name and ("coin" in name or "dollar" in name or "stable" in name)):
-        return True
+    if any(k in name for k in ["stable", "tether", "usd coin", "dai"]): return True
 
-    p = float(row.get("price", 0) or 0)
-    m7 = float(row.get("mom_7d", 0) or 0)
-    m30 = float(row.get("mom_30d", 0) or 0)
-    if 0.985 <= p <= 1.015 and abs(m7) < 1.0 and abs(m30) < 2.0:
-        return True
-
+    # Detección por comportamiento de precio (si se mantiene cerca de 1 USD)
+    try:
+        p = float(row.get("price", 0))
+        m7 = abs(float(row.get("mom_7d", 0)))
+        if 0.98 <= p <= 1.02 and m7 < 0.5:
+            return True
+    except:
+        pass
     return False
-
 
 def is_gold(row) -> bool:
     sym = (row.get("symbol") or "").upper().strip()
-    if sym in GOLD:
-        return True
+    if sym in GOLD: return True
     name = (row.get("name") or "").lower()
-    return "gold" in name
-
+    return "gold" in name or "pax gold" in name
 
 def is_major(row) -> bool:
     sym = (row.get("symbol") or "").upper().strip()
-    rank = int(row.get("rank", 999) or 999)
+    rank = int(row.get("rank", 999))
     return (sym in MAJORS_SET) or (rank <= 10)
-
 
 def split_alts_and_majors(rows):
     majors, alts = [], []
     for r in rows:
-        (majors if is_major(r) else alts).append(r)
+        if is_major(r): majors.append(r)
+        else: alts.append(r)
     return majors, alts
 
-
 def estimate_risk(row) -> str:
-    cap = float(row.get("market_cap", 0) or 0)
-    if cap >= 200_000_000_000:
-        return "LOW"
-    if cap >= 30_000_000_000:
-        return "MEDIUM"
-    return "HIGH"
+    try:
+        cap = float(row.get("market_cap", 0))
+        if cap >= 50_000_000_000: return "LOW"
+        if cap >= 5_000_000_000: return "MEDIUM"
+        return "HIGH"
+    except:
+        return "HIGH"
