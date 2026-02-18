@@ -8,36 +8,49 @@ logger = logging.getLogger(__name__)
 def gemini_render(system_prompt: str, user_prompt: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return "Falta la clave API."
+        return "❌ Error: No hay clave API en Railway."
 
     try:
         genai.configure(api_key=api_key)
         
-        # Probamos con el nombre de modelo más específico y actualizado
-        # 'gemini-1.5-flash-latest' suele evitar el error 404 en Railway
-        model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash-latest', 
-            system_instruction=system_prompt
-        )
+        # --- DIAGNÓSTICO: LISTAR MODELOS REALES ---
+        modelos_disponibles = []
+        try:
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    modelos_disponibles.append(m.name.replace('models/', ''))
+            logger.info(f"✅ Modelos que tu clave SI puede usar: {modelos_disponibles}")
+        except Exception as e:
+            logger.error(f"❌ No pude listar los modelos: {e}")
 
-        response = model.generate_content(user_prompt)
+        # --- SELECCIÓN AUTOMÁTICA ---
+        # Si 'gemini-1.5-flash' está en la lista, lo usamos. Si no, usamos el primero que aparezca.
+        if not modelos_disponibles:
+            # Si la lista está vacía, intentamos los nombres estándar por desesperación
+            modelos_disponibles = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+        
+        target_model = 'gemini-1.5-flash' if 'gemini-1.5-flash' in modelos_disponibles else modelos_disponibles[0]
+        
+        logger.info(f"🤖 Intentando usar el modelo: {target_model}")
+
+        # Configuración del modelo
+        model = genai.GenerativeModel(model_name=target_model)
+        
+        # Respuesta simple (unimos prompts para máxima compatibilidad)
+        prompt_final = f"{system_prompt}\n\nPregunta: {user_prompt}"
+        response = model.generate_content(prompt_final)
         
         if response and response.text:
             return response.text
-        return "El modelo no generó texto."
+        return "⚠️ Google devolvió una respuesta vacía."
 
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Error: {error_msg}")
+        logger.error(f"💥 Error final: {error_msg}")
         
-        # SI VUELVE A DAR 404, PROBAMOS EL MODELO PRO QUE SIEMPRE ESTÁ DISPONIBLE
-        if "404" in error_msg or "not found" in error_msg.lower():
-            try:
-                logger.info("Intentando con gemini-pro (fallback)...")
-                model_alt = genai.GenerativeModel('gemini-pro')
-                res = model_alt.generate_content(f"{system_prompt}\n\n{user_prompt}")
-                return res.text
-            except:
-                return "Error 404 persistente: Google no reconoce el modelo en esta cuenta."
-        
-        return f"Error: {error_msg}"
+        if "403" in error_msg:
+            return "❌ Error 403: Tu clave API no tiene permisos. ¿Aceptaste los términos en Google AI Studio?"
+        if "404" in error_msg:
+            return "❌ Error 404: Google sigue diciendo que el modelo no existe. Intenta crear una CLAVE NUEVA."
+            
+        return f"❌ Error técnico: {error_msg}"
