@@ -5,7 +5,8 @@ from typing import List, Dict, Optional
 
 # Se asume que estos módulos existen en tu carpeta core/
 from core.market import (
-    fetch_top100_market,
+    fetch_coingecko_top100, # Cambiado a la versión multi-fuente
+    verify_prices,           # Nueva función de validación
     split_alts_and_majors,
     estimate_risk,
     is_stable,
@@ -88,8 +89,11 @@ def compute_engine_score(row: Dict) -> float:
         liq = (vol / cap * 150.0) if cap > 0 else 0
         liq = min(liq, 8.0)
 
+        # Si el precio no está verificado entre exchanges, bajamos un poco el score
+        trust_penalty = 0.0 if row.get("verified", True) else -5.0
+
         learn = float(get_learning_boost(row.get("symbol", "")) or 0)
-        return base + consistency + dd_penalty + liq + learn
+        return base + consistency + dd_penalty + liq + learn + trust_penalty
     except Exception:
         return 0.0
 
@@ -98,41 +102,35 @@ def pick_balanced(majors: List[Dict], alts: List[Dict], total: int):
     a_target = total - m_target
     majors_sel = majors[:m_target]
     alts_sel = alts[:a_target]
-    # Rellenar si falta alguno
     if len(majors_sel) < m_target:
         alts_sel = (alts_sel + alts[a_target:a_target + (m_target - len(majors_sel))])[:total]
     return majors_sel, alts_sel
 
-def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], alts: List[Dict]) -> str:
+def raw_compact_json(mode: str, risk_pref: Optional[str], majors: List[Dict], alts: List[Dict], stats: Dict) -> str:
     def compact(items):
         return [{
             "symbol": r["symbol"],
-            "name": r["name"],
             "score": round(float(r.get("engine_score", 0)), 1),
             "risk": r.get("risk", "MEDIUM"),
-            "mom7": round(float(r.get("mom_7d", 0)), 2),
-            "mom30": round(float(r.get("mom_30d", 0)), 2),
-            "price": float(r.get("price", 0)),
-            "mcap": float(r.get("market_cap", 0)),
+            "price": float(r.get("price_anchor") or r.get("price", 0)),
+            "verified": r.get("verified", False),
+            "spread": round(r.get("spread_pct", 0), 2)
         } for r in items]
 
     return json.dumps({
         "mode": mode,
         "risk_pref": risk_pref,
+        "market_stats": stats,
         "no_alts": compact(majors),
         "alts": compact(alts)
     }, ensure_ascii=False)
 
 def llm_render_wrapped(user_text: str, payload_json: str, fallback_text: str) -> str:
     system = (
-        "Sos un analista cripto experto de Argentina. Usás lenguaje rioplatense (che, vos, tené cuidado). "
-        "No das consejo financiero. Sé directo. Usá únicamente los datos del JSON."
+        "Sos un analista cripto experto de Argentina. Usás lenguaje rioplatense. "
+        "Sé crítico con los datos. Si una moneda no está 'verified', mencioná que el precio puede variar entre exchanges."
     )
-    user = (
-        f"Pedido del usuario: {user_text}\n\n"
-        f"Datos del mercado: {payload_json}\n\n"
-        "Respondé con un breve análisis y 5 a 8 recomendaciones claras."
-    )
+    user = f"Pedido: {user_text}\n\nDatos JSON: {payload_json}"
     try:
         out = gemini_render(system, user)
         return out if out else fallback_text
@@ -145,14 +143,14 @@ def build_engine_analysis(user_text: str) -> str:
     top_n = parse_top_n(user_text)
     risk_pref = detect_risk_pref(user_text)
 
-    rows = fetch_top100_market()
-    # Filtro de seguridad
+    # 1. Obtener datos y verificar precios multi-fuente
+    raw_rows = fetch_coingecko_top100()
+    rows, v_stats = verify_prices(raw_rows)
+
+    # 2. Filtrar stables y oro
     rows = [r for r in rows if r.get("symbol") and not is_stable(r) and not is_gold(r)]
     
-    # Búsqueda de símbolo específico
-    tokens = user_text.upper().replace("?", "").split()
-    symbol_found = next((r for r in rows if r["symbol"] in tokens), None)
-
+    # 3. Enriquecer con Scores
     enriched = []
     for r in rows:
         rr = dict(r)
@@ -162,22 +160,27 @@ def build_engine_analysis(user_text: str) -> str:
     
     enriched.sort(key=lambda x: x["engine_score"], reverse=True)
 
-    if symbol_found:
-        r = next((x for x in enriched if x["symbol"] == symbol_found["symbol"]), None)
+    # 4. Búsqueda por símbolo específico
+    tokens = user_text.upper().replace("?", "").split()
+    symbol_match = next((r for r in enriched if r["symbol"] in tokens), None)
+
+    if symbol_match:
+        r = symbol_match
+        v_status = "✅ Verificado" if r['verified'] else "⚠️ Spread alto"
         return (
             f"📊 *{r['symbol']} ({r['name']})*\n"
-            f"💰 Precio: {price_fmt(r['price'])}\n"
+            f"💰 Precio: {price_fmt(r['price_anchor'] or r['price'])} ({v_status})\n"
             f"⚡ Score: {r['engine_score']:.1f} | Riesgo: {r['risk']}\n"
             f"📈 7d: {pct(r['mom_7d'])} | 30d: {pct(r['mom_30d'])}\n"
             f"💎 Cap: {money(r['market_cap'])}"
         )
 
+    # 5. Respuesta General
     top = enriched[:top_n]
     majors, alts = split_alts_and_majors(top)
     majors_sel, alts_sel = pick_balanced(majors, alts, top_n)
 
-    fallback = f"Análisis {mode} disponible. (Error de IA, mostrando básico)\n" + \
-               f"Top Sugerido: {', '.join([x['symbol'] for x in majors_sel[:5]])}"
-
-    payload = raw_compact_json(mode, risk_pref, majors_sel, alts_sel)
+    fallback = f"Top Sugerido: {', '.join([x['symbol'] for x in majors_sel[:5]])}"
+    payload = raw_compact_json(mode, risk_pref, majors_sel, alts_sel, v_stats)
+    
     return llm_render_wrapped(user_text, payload, fallback)
