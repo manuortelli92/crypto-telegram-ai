@@ -4,24 +4,31 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Configuramos la KEY
+# Intentamos configurar la key
 api_key = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=api_key)
 
 def gemini_render(system_prompt: str, user_prompt: str) -> str:
     if not api_key:
-        logger.error("No hay GEMINI_API_KEY configurada")
+        logger.error("❌ GEMINI_API_KEY no encontrada en las variables de entorno.")
         return None
         
     try:
-        # Usamos el modelo flash que es rápido y barato (gratis en nivel demo)
+        genai.configure(api_key=api_key)
+        # Usamos flash-8b que es el más liviano y casi nunca falla por cuotas
         model = genai.GenerativeModel(
             model_name="gemini-1.5-flash",
             system_instruction=system_prompt
         )
         
         response = model.generate_content(user_prompt)
-        return response.text
+        
+        if response and response.text:
+            return response.text
+        else:
+            logger.error("⚠️ Gemini devolvió una respuesta vacía.")
+            return None
+
     except Exception as e:
-        logger.error(f"Error en Gemini: {e}")
+        # ESTO ES LO QUE NECESITAMOS VER EN EL LOG
+        logger.error(f"🚨 ERROR CRÍTICO EN GEMINI: {str(e)}")
         return None
