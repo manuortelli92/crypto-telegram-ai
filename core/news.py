@@ -2,21 +2,22 @@ import time
 import requests
 import xml.etree.ElementTree as ET
 import logging
+import re
 from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-HEADERS = {"User-Agent": "OrtelliCryptoAI/1.0"}
-TIMEOUT = 15
+HEADERS = {"User-Agent": "OrtelliCryptoAI/1.0", "Accept": "application/xml, text/xml"}
+TIMEOUT = 12
 
-# RSS Feeds confiables
+# RSS Feeds seleccionados por calidad de info
 RSS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
 ]
 
-_TTL = 900  # 15 minutos de cache (las noticias no cambian cada segundo)
+_TTL = 900  # 15 minutos
 _CACHE: Dict[str, tuple] = {}
 
 def _cache_get(key: str):
@@ -28,73 +29,83 @@ def _cache_get(key: str):
     return None
 
 def _cache_set(key: str, val):
-    _CACHE[key] = (time.time(), val)
+    if val:
+        _CACHE[key] = (time.time(), val)
+
+def clean_html(text: str) -> str:
+    """Limpia etiquetas HTML y entidades raras de las descripciones RSS."""
+    if not text: return ""
+    # Quita tags HTML
+    text = re.sub(r'<[^>]*>', '', text)
+    # Quita espacios extra
+    return " ".join(text.split())
 
 def fetch_rss(url: str) -> List[Dict]:
-    """Descarga y parsea un feed RSS de noticias cripto."""
+    """Descarga y parsea noticias con manejo de errores de encoding."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         
-        # Usamos un parser que maneje mejor posibles errores de encoding
-        root = ET.fromstring(r.content)
-        items = []
+        # Reparación: CoinTelegraph y otros a veces mandan bytes que ElementTree no quiere
+        content = r.content.decode('utf-8', errors='ignore')
+        root = ET.fromstring(content)
         
-        # Buscamos los elementos 'item' dentro del canal
+        items = []
         for it in root.findall(".//item"):
-            title = (it.findtext("title") or "").strip()
+            title = clean_html(it.findtext("title") or "")
             link = (it.findtext("link") or "").strip()
-            pub = (it.findtext("pubDate") or "").strip()
-            # Limpiamos el HTML básico que suele venir en las descripciones
-            desc = (it.findtext("description") or "").strip()
+            source_domain = url.split("/")[2].replace("www.", "")
             
             if title and link:
                 items.append({
                     "title": title,
                     "link": link,
-                    "published": pub,
-                    "summary": desc[:300] + "..." if len(desc) > 300 else desc,
-                    "source": url.split("/")[2], # Guarda solo el dominio (ej: cointelegraph.com)
+                    "source": source_domain
                 })
         return items
     except Exception as e:
-        logger.error(f"Error parseando RSS de {url}: {e}")
+        logger.warning(f"⚠️ Fuente RSS caída o lenta ({url.split('/')[2]}): {e}")
         return []
 
 def fetch_news(limit_total: int = 15) -> List[Dict]:
-    """Obtiene noticias de todas las fuentes, las deduplica y las cachea."""
-    key = f"news_feed"
+    """Motor de noticias con deduplicación y fallback."""
+    key = "news_feed_unified"
     cached = _cache_get(key)
-    if cached is not None:
+    if cached:
         return cached[:limit_total]
 
-    all_items: List[Dict] = []
+    all_items = []
     for feed in RSS_FEEDS:
         all_items.extend(fetch_rss(feed))
 
-    # 1. Deduplicación por link o título
-    seen_links = set()
+    if not all_items:
+        # Si todo falló, intentamos devolver el cache aunque esté vencido
+        old = _CACHE.get(key)
+        return old[1][:limit_total] if old else []
+
+    # Deduplicación por título (algunos feeds repiten noticias con distinto link)
+    seen_titles = set()
     unique_news = []
     for it in all_items:
-        if it["link"] not in seen_links:
-            seen_links.add(it["link"])
+        t_normalized = it["title"].lower().strip()
+        if t_normalized not in seen_titles:
+            seen_titles.add(t_normalized)
             unique_news.append(it)
 
-    # 2. Ordenar (si las fechas están en formato estándar, las más nuevas primero)
-    # Por ahora solo limitamos
-    out = unique_news[:40] # Guardamos 40 en cache
-    _cache_set(key, out)
-    
-    return out[:limit_total]
+    _cache_set(key, unique_news)
+    return unique_news[:limit_total]
 
-def get_news_summary_for_llm(limit: int = 8) -> str:
-    """Formatea las noticias para que Gemini las pueda leer fácilmente."""
+def get_news_summary_for_llm(limit: int = 6) -> str:
+    """
+    Formatea las noticias para el Engine. 
+    Asegura que Gemini reciba info fresca para su análisis.
+    """
     news = fetch_news(limit)
     if not news:
-        return "No hay noticias relevantes de último momento."
+        return "No hay noticias de impacto encontradas en la última hora."
     
-    lines = []
-    for n in news:
-        lines.append(f"- {n['title']} (Fuente: {n['source']})")
+    # Construcción de un bloque de texto compacto
+    header = "📰 NOTICIAS RECIENTES DEL MERCADO:\n"
+    lines = [f"- {n['title']} (Vía: {n['source']})" for n in news]
     
-    return "\n".join(lines)
+    return header + "\n".join(lines)
