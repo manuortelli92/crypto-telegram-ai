@@ -1,62 +1,53 @@
 import os
 import logging
+import google.generativeai as genai
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 # Configuración desde variables de entorno
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-_client = None
+# Inicializar la API solo si hay clave
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    logger.error("❌ No se encontró GEMINI_API_KEY en las variables de entorno.")
 
-def _get_client():
-    """Inicializa el cliente de Google GenAI de forma segura (Singleton)."""
-    global _client
-    if _client is not None:
-        return _client
-    
+def gemini_render(system_prompt: str, user_prompt: str) -> Optional[str]:
+    """
+    Envía la consulta a Gemini y devuelve la respuesta del analista.
+    """
     if not GEMINI_API_KEY:
-        logger.error("CRÍTICO: GEMINI_API_KEY no encontrada en las variables de entorno.")
-        return None
-        
-    try:
-        from google import genai
-        _client = genai.Client(api_key=GEMINI_API_KEY)
-        return _client
-    except ImportError:
-        logger.error("ERROR: La librería 'google-genai' no está instalada. Ejecutá: pip install google-genai")
-        return None
-    except Exception as e:
-        logger.error(f"Error inesperado al inicializar Gemini Client: {e}")
-        return None
+        return "Che, no configuraste la API Key de Gemini. Así no arranco ni a palos."
 
-def gemini_render(system: str, user: str) -> Optional[str]:
-    """
-    Envía el prompt al modelo de Google y devuelve la respuesta limpia.
-    """
-    client = _get_client()
-    if not client:
-        return None
-        
     try:
-        # Usamos la configuración de generación para mayor precisión
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user,
-            config={
-                "system_instruction": system,
-                "temperature": 0.4, # Un poco más de creatividad, pero manteniendo coherencia
-                "max_output_tokens": 1000,
-            },
+        model = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            system_instruction=system_prompt
         )
         
-        if not response or not hasattr(response, "text"):
-            logger.warning("Gemini devolvió una respuesta vacía o sin texto.")
-            return None
-            
-        return response.text.strip()
+        # Configuración de generación para que no se ponga místico
+        generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "max_output_tokens": 1024,
+        }
+
+        response = model.generate_content(
+            user_prompt,
+            generation_config=generation_config
+        )
+
+        if response and response.text:
+            return response.text
         
+        return None
+
     except Exception as e:
-        logger.error(f"Error en la llamada a Gemini API: {e}")
+        logger.error(f"Error llamando a Gemini: {e}")
+        # Si es un error de cuota (429), avisamos
+        if "429" in str(e):
+            return "Pará un poco que Google me está limitando por pedirle tanto. Aguantá un toque y probá de nuevo."
         return None
