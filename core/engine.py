@@ -2,9 +2,9 @@ import os
 import json
 import logging
 import traceback
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
-# Imports correctos
+# Imports verificados
 from core.sources import fetch_coingecko_top100 
 from core.market import (
     verify_prices, 
@@ -13,56 +13,103 @@ from core.market import (
     is_stable, 
     is_gold
 )
-from core.learning import get_learning_boost
+# Cambiamos a apply_patch_to_session que es el método robusto que reparamos antes
+from core.learning import apply_patch_to_session 
 from core.llm_gemini import gemini_render
-from core.news import get_news_summary_for_llm
+
+# Nota: Si no tenés core/news.py todavía, esto podría fallar. 
+# Lo envolvemos en un try/except preventivo.
+try:
+    from core.news import get_news_summary_for_llm
+except ImportError:
+    def get_news_summary_for_llm(): return "No hay noticias disponibles."
 
 logger = logging.getLogger(__name__)
 
 def build_engine_analysis(user_text: str, chat_id: int, state: Dict) -> str:
+    """
+    ORQUESTADOR MAESTRO: Une mercado, memoria e IA.
+    """
     try:
-        # 1. Intentar buscar datos
+        logger.info(f"🤖 Procesando solicitud para chat_id {chat_id}: '{user_text}'")
+
+        # 1. Sincronizar Memoria y Preferencias (Learning)
+        # Esto recupera modo, top_n, riesgo y contexto previo
+        user_prefs = apply_patch_to_session(state, chat_id, user_text)
+        
+        # 2. Obtener Datos de Mercado (Sources)
         raw_rows = fetch_coingecko_top100()
         if not raw_rows:
-            return "❌ Error: CoinGecko no devolvió nada. Revisá la CG_API_KEY en Railway."
+            return "❌ Error: No pude conectar con el servidor de precios. Reintentá en unos segundos."
 
-        # 2. Procesar con Market
+        # 3. Filtrado y Scoring (Market)
         rows, v_stats = verify_prices(raw_rows)
         
-        # 3. Limpieza y Score (con protección anti-None)
         final_rows = []
         for r in rows:
-            if is_stable(r) or is_gold(r): continue
+            # Filtro de Stables/Oro y Tickers prohibidos por el usuario
+            symbol = r.get("symbol", "").upper()
+            if is_stable(r) or is_gold(r) or symbol in user_prefs.get("avoid", []):
+                continue
             
-            # Forzamos valores numéricos para que no explote la cuenta
-            p_change = r.get("price_change_percentage_24h") or 0
-            r["engine_score"] = float(p_change) + float(get_learning_boost(r.get("symbol", "")) or 0)
+            # Cálculo de Score con boost de preferencia del usuario (focus)
+            p_change = float(r.get("price_change_percentage_24h") or 0)
+            focus_boost = 5.0 if symbol in user_prefs.get("focus", []) else 0.0
+            
+            r["engine_score"] = p_change + focus_boost
             final_rows.append(r)
 
+        # Ordenar por score según el modo (aquí podrías expandir la lógica)
         final_rows.sort(key=lambda x: x.get("engine_score", 0), reverse=True)
 
-        # 4. Respuesta rápida si es una moneda
-        query = user_text.upper().strip().replace("/", "")
+        # 4. Detección de consulta específica (Ticker direct)
+        query = user_text.upper().strip().replace("/", "").replace("$", "")
         for r in final_rows:
-            if r.get("symbol", "").upper() == query:
-                return f"📊 *{r['name']}*\n💰 Precio: ${r.get('current_price')}\n📈 24h: {r.get('price_change_percentage_24h'):.2f}%"
+            if symbol == query:
+                trend = "🚀" if r.get("price_change_percentage_24h", 0) > 0 else "📉"
+                return (f"{trend} *{r['name']} ({symbol})*\n"
+                        f"💰 Precio: ${r.get('current_price'):,}\n"
+                        f"📊 Var. 24h: {r.get('price_change_percentage_24h'):.2f}%\n"
+                        f"🏆 Ranking: #{r.get('market_cap_rank')}")
 
-        # 5. Si no es moneda, llamar a Gemini
-        top_10 = final_rows[:10]
-        payload = {"picks": [f"{r['symbol']}: {r['engine_score']}" for r in top_10]}
+        # 5. Preparar Contexto para Gemini
+        # Tomamos el Top N que el usuario pidió (o 20 por defecto)
+        top_n_limit = user_prefs.get("top_n", 20)
+        market_summary = [
+            {
+                "s": r['symbol'].upper(),
+                "p": r['current_price'],
+                "c": f"{r['price_change_percentage_24h']:.1f}%"
+            } for r in final_rows[:top_n_limit]
+        ]
         
-        sys_prompt = "Sos un analista cripto argentino. Sé breve."
-        user_prompt = f"Datos: {json.dumps(payload)}\nPregunta: {user_text}"
+        news = get_news_summary_for_llm()
+
+        # Construcción del Prompt con Memoria
+        sys_prompt = (
+            "Sos un analista financiero experto en cripto. "
+            "Tu estilo es profesional pero cercano (estilo argentino 'City'). "
+            "Usá Markdown (negritas) para destacar tickers. Sé conciso."
+        )
         
+        user_prompt = (
+            f"CONTEXTO PREVIO:\n{user_prefs.get('context', 'Sin historial.')}\n\n"
+            f"PREFERENCIAS: Riesgo {user_prefs.get('risk_pref', 'Medio')}. "
+            f"Foco en: {user_prefs.get('focus', 'General')}.\n\n"
+            f"DATOS MERCADO:\n{json.dumps(market_summary)}\n\n"
+            f"NOTICIAS:\n{news}\n\n"
+            f"PREGUNTA USUARIO: {user_text}"
+        )
+
+        # 6. Llamada a la IA
         ai_res = gemini_render(sys_prompt, user_prompt)
         
-        if not ai_res:
-            return "⚠️ Gemini no respondió. ¿Pusiste la GEMINI_API_KEY en Railway?"
+        if not ai_res or "Error" in ai_res:
+            return "⚠️ La IA está tomando un café. Intentá de nuevo o consultá un ticker específico (ej: BTC)."
             
         return ai_res
 
     except Exception as e:
-        # ESTO ES LO IMPORTANTE: Nos va a decir el error real en Telegram
-        error_detallado = traceback.format_exc()
-        logger.error(f"Error crítico: {error_detallado}")
-        return f"🤯 *Explotó algo internamente:*\n`{str(e)}`"
+        error_msg = traceback.format_exc()
+        logger.error(f"💥 EXPLOSIÓN EN ENGINE: {error_msg}")
+        return f"🤯 *Hubo un cortocircuito interno:*\n`{str(e)}`"
