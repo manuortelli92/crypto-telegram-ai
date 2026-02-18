@@ -1,7 +1,16 @@
+# --- Framework de Telegram (Usamos pyTelegramBotAPI por compatibilidad con tu código) ---
+pyTelegramBotAPI==4.22.1
 
-python-telegram-bot==21.6
-requests==2.31.0
-numpy==1.26.4
-apscheduler==3.10.4
-python-dateutil==2.9.0.post0
+# --- Inteligencia Artificial y Datos ---
 google-generativeai==0.8.3
+requests==2.32.3
+
+# --- Utilidades y Gestión de Entorno ---
+python-dotenv==1.0.1
+python-dateutil==2.9.0
+
+# --- Servidor y Programación ---
+apscheduler==3.10.4
+# Numpy es opcional a menos que hagas cálculos estadísticos pesados, 
+# pero lo dejamos si lo necesitas para otras funciones.
+numpy==1.26.4
