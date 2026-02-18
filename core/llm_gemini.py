@@ -2,47 +2,66 @@ import os
 import logging
 import google.generativeai as genai
 
+# Configuración de logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def gemini_render(system_prompt: str, user_prompt: str) -> str:
+    # 1. Obtener clave y modelo de las variables de Railway
     api_key = os.getenv("GEMINI_API_KEY")
-    # Intentamos leer el modelo de la variable, si no, usamos el flash
+    # Si no hay variable, usamos el flash por defecto
     model_id = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     
     if not api_key:
-        return "Falta GEMINI_API_KEY en Railway."
+        logger.error("❌ No se encontró la variable GEMINI_API_KEY")
+        return "Error: Falta la configuración de la clave API."
 
     try:
+        # 2. Configurar la API
         genai.configure(api_key=api_key)
         
-        # --- INTENTO 1: Usar el modelo configurado (Gemini 1.5) ---
-        try:
-            # Limpiamos el nombre por si tiene "models/" de más
-            clean_model = model_id.replace("models/", "")
-            model = genai.GenerativeModel(
-                model_name=clean_model,
-                system_instruction=system_prompt
-            )
-            response = model.generate_content(user_prompt)
+        # 3. Limpiar el nombre del modelo (por si pusiste 'models/')
+        model_name = model_id.split('/')[-1] 
+        
+        # 4. Configurar el modelo
+        model = genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=system_prompt
+        )
+        
+        # 5. Ajustes de seguridad (para evitar bloqueos por error)
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+
+        # 6. Generar respuesta
+        response = model.generate_content(
+            user_prompt,
+            safety_settings=safety_settings
+        )
+        
+        if response and response.text:
             return response.text
-            
-        except Exception as e:
-            # --- INTENTO 2: Fallback al modelo Pro (Más compatible) ---
-            logger.warning(f"Fallo el modelo {model_id}, intentando gemini-pro...")
-            model_alt = genai.GenerativeModel(model_name='gemini-pro')
-            # El modelo pro antiguo no acepta system_instruction separado
-            prompt_final = f"{system_prompt}\n\nUsuario: {user_prompt}"
-            response = model_alt.generate_content(prompt_final)
-            return response.text
+        else:
+            return "El modelo no generó respuesta (posible bloqueo de seguridad)."
 
     except Exception as e:
         error_str = str(e)
-        logger.error(f"Error definitivo: {error_str}")
+        logger.error(f"🚨 Error en Gemini: {error_str}")
         
+        # Manejo de errores específicos
         if "404" in error_str:
-            return "Error 404: Google no reconoce el modelo. Revisa el requirements.txt."
+            return "Error 404: El modelo no existe. Asegúrate de que el 'requirements.txt' esté corregido."
         if "location" in error_str.lower():
-            return "Error de Región: Cambia la región de Railway a US-East."
+            return "Error de Región: Google bloquea esta IP. Cambia la región de Railway a US-East-1."
             
-        return f"Error: {error_str}"
+        # Si el error es por 'system_instruction' (en modelos viejos), intentar modo simple
+        try:
+            model_basic = genai.GenerativeModel(model_name='gemini-pro')
+            res = model_basic.generate_content(f"{system_prompt}\n\n{user_prompt}")
+            return res.text
+        except:
+            return f"Error técnico detallado: {error_str}"
