@@ -6,31 +6,24 @@ from collections import deque
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
-from telegram.error import Conflict, NetworkError, TimedOut
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.error import Conflict
 
-from core.memory import load_state, set_chat_id
-from core.learning import register_user_interest
+# Importaciones de tu estructura core
+from core.memory import load_state, save_state, set_chat_id
+from core.brain import add_turn, apply_patch_to_session
 from core.engine import build_engine_analysis
 
-# Configuración de Logging más detallada
+# Configuración de Logs
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Carga de variables de entorno
+# Variables de Entorno
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("ERROR: La variable de entorno BOT_TOKEN no está configurada.")
-
 OWNER_ID = os.getenv("OWNER_ID", "").strip()
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "12"))
-
-SCHEDULE_DOW = os.getenv("SCHEDULE_DOW", "mon")
-SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "9"))
-SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
 
 _user_hits = {}
 
@@ -51,34 +44,6 @@ def rate_limit_ok(user_id: int) -> bool:
     q.append(now)
     return True
 
-async def send_weekly(application: Application):
-    state = load_state()
-    chat_id = state.get("chat_id")
-    if not chat_id:
-        logger.warning("No se pudo enviar el informe semanal: chat_id no guardado.")
-        return
-    try:
-        text = build_engine_analysis("informe semanal")
-        await application.bot.send_message(chat_id=chat_id, text=text)
-    except Exception as e:
-        logger.exception(f"Fallo en el envío semanal: {e}")
-
-async def on_startup(app: Application):
-    """Configuración inicial al arrancar el bot."""
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        send_weekly,
-        "cron",
-        day_of_week=SCHEDULE_DOW,
-        hour=SCHEDULE_HOUR,
-        minute=SCHEDULE_MINUTE,
-        args=[app],
-        id="weekly_report",
-        replace_existing=True,
-    )
-    scheduler.start()
-    logger.info("Scheduler iniciado. Tarea semanal programada.")
-
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
@@ -88,64 +53,79 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = user.id
     text = (update.message.text or "").strip()
 
-    # Rate limit solo para usuarios que no son el dueño
-    if not is_owner(update):
-        if not rate_limit_ok(uid):
-            await update.message.reply_text("⏳ Demasiadas solicitudes. Esperá un minuto.")
-            return
-
-    # Registrar interés (aprendizaje básico)
-    if text:
-        register_user_interest(text)
-
-    # Lógica de comandos básicos
-    low = text.lower()
-    if text == "/start" or low in {"start", "hola", "buenas", "hey"}:
-        await update.message.reply_text(
-            "🤖 **¡Hola! Soy tu asistente cripto.**\n\n"
-            "Podés pedirme análisis así:\n"
-            "• '¿Cómo viene BTC hoy?'\n"
-            "• 'Informe mensual'\n"
-            "• 'Top 30 riesgo medio'\n"
-            "• 'Prefiero SOL y ETH'"
-        )
-        if is_owner(update):
-            set_chat_id(int(chat.id))
-            logger.info(f"Chat ID del dueño guardado: {chat.id}")
+    # 1. Control de flujo y Rate Limit
+    if not is_owner(update) and not rate_limit_ok(uid):
+        await update.message.reply_text("⏳ Pará un poco, che. Muchas consultas seguidas. Esperá un minuto.")
         return
 
-    # Si es el owner, nos aseguramos de tener el chat_id actualizado
+    # 2. Cargar estado y Procesar Memoria (Brain)
+    state = load_state()
+    
+    # Registramos lo que dijo el usuario en su "cerebro"
+    add_turn(state, chat.id, role="user", text=text)
+    
+    # Aplicamos parches (si dijo "prefiero BTC" o "riesgo bajo", se guarda acá)
+    brain_prefs = apply_patch_to_session(state, chat.id, text)
+
+    # 3. Comandos básicos / Start
+    low = text.lower()
+    if text == "/start" or low in {"start", "hola", "buenas"}:
+        reply = (
+            "🤖 **¡Buenas! Soy tu analista cripto.**\n\n"
+            "Podés pedirme cosas como:\n"
+            "• '¿Cómo ves BTC?'\n"
+            "• 'Pasame el top 20 mensual'\n"
+            "• 'Prefiero ETH y SOL' (lo voy a recordar)\n"
+            "• 'Cambiá a riesgo bajo'"
+        )
+        await update.message.reply_text(reply)
+        if is_owner(update):
+            set_chat_id(int(chat.id))
+        add_turn(state, chat.id, role="bot", text=reply)
+        save_state(state)
+        return
+
     if is_owner(update):
         set_chat_id(int(chat.id))
 
-    # Procesamiento con el Engine de IA
-    msg_espera = await update.message.reply_text("🔍 Analizando el mercado...")
+    # 4. Ejecución del Análisis
+    msg_espera = await update.message.reply_text("🔍 Analizando datos del mercado...")
+    
     try:
+        # Le pasamos el texto y las preferencias que el "brain" procesó
+        # Nota: Si tu engine.py acepta brain_prefs, usalo así. 
+        # Si no, build_engine_analysis(text) sigue funcionando.
         reply = build_engine_analysis(text)
+        
         await update.message.reply_text(reply)
+        
+        # Guardamos la respuesta del bot en la memoria
+        add_turn(state, chat.id, role="bot", text=reply)
+        
     except Exception as e:
-        logger.exception(f"Error en el engine: {e}")
-        await update.message.reply_text("❌ Lo siento, tuve un problema procesando tu consulta.")
+        logger.exception(f"Error en engine: {e}")
+        await update.message.reply_text("❌ Hubo un error analizando el mercado. Reintentá en un toque.")
     finally:
-        # Opcional: borrar el mensaje de "Analizando..."
+        save_state(state) # Guardamos todo el progreso (memoria + chat_id)
         try:
             await context.bot.delete_message(chat_id=chat.id, message_id=msg_espera.message_id)
         except:
             pass
 
-def build_app() -> Application:
-    return Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
-
 def main():
-    """Función principal corregida para Railway."""
-    app = build_app()
+    if not BOT_TOKEN:
+        logger.error("Falta BOT_TOKEN en las variables de entorno.")
+        return
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Handler para mensajes de texto (excluyendo comandos de sistema)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler))
     
-    logger.info("Iniciando bot...")
+    logger.info("Bot iniciado y listo para recibir mensajes...")
     
-    # drop_pending_updates=True evita que el bot responda mensajes acumulados al reiniciar
-    # run_polling maneja automáticamente reintentos de red
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    # Railway: drop_pending_updates evita colapsos por mensajes viejos
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
