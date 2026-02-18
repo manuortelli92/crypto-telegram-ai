@@ -3,4 +3,4 @@ requests==2.31.0
 numpy==1.26.4
 apscheduler==3.10.4
 python-dateutil==2.9.0.post0
-google-generativeai>=0.7.2
+google-generativeai==0.8.3
