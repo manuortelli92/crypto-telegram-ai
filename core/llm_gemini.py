@@ -8,49 +8,51 @@ logger = logging.getLogger(__name__)
 def gemini_render(system_prompt: str, user_prompt: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return "❌ Error: No hay clave API en Railway."
+        return "❌ Error: No hay clave API configurada."
 
     try:
         genai.configure(api_key=api_key)
         
-        # --- DIAGNÓSTICO: LISTAR MODELOS REALES ---
-        modelos_disponibles = []
-        try:
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    modelos_disponibles.append(m.name.replace('models/', ''))
-            logger.info(f"✅ Modelos que tu clave SI puede usar: {modelos_disponibles}")
-        except Exception as e:
-            logger.error(f"❌ No pude listar los modelos: {e}")
+        # Usamos el modelo Flash con un nombre que fuerza la versión más estable
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            system_instruction=system_prompt
+        )
+        
+        # CONFIGURACIÓN DE SEGURIDAD AL MÍNIMO
+        # Google a veces bloquea respuestas inofensivas. Con esto lo evitamos.
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
 
-        # --- SELECCIÓN AUTOMÁTICA ---
-        # Si 'gemini-1.5-flash' está en la lista, lo usamos. Si no, usamos el primero que aparezca.
-        if not modelos_disponibles:
-            # Si la lista está vacía, intentamos los nombres estándar por desesperación
-            modelos_disponibles = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+        # Intentar generar contenido
+        response = model.generate_content(
+            user_prompt,
+            safety_settings=safety_settings
+        )
         
-        target_model = 'gemini-1.5-flash' if 'gemini-1.5-flash' in modelos_disponibles else modelos_disponibles[0]
-        
-        logger.info(f"🤖 Intentando usar el modelo: {target_model}")
+        # Verificar si Google bloqueó la respuesta por seguridad
+        if response.candidates and response.candidates[0].finish_reason == 3:
+            return "⚠️ Google bloqueó esta respuesta por sus políticas de seguridad."
 
-        # Configuración del modelo
-        model = genai.GenerativeModel(model_name=target_model)
-        
-        # Respuesta simple (unimos prompts para máxima compatibilidad)
-        prompt_final = f"{system_prompt}\n\nPregunta: {user_prompt}"
-        response = model.generate_content(prompt_final)
-        
         if response and response.text:
             return response.text
-        return "⚠️ Google devolvió una respuesta vacía."
+        
+        return "⚠️ Google devolvió una respuesta vacía. Probá con otra pregunta."
 
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"💥 Error final: {error_msg}")
+        logger.error(f"💥 Error: {error_msg}")
         
-        if "403" in error_msg:
-            return "❌ Error 403: Tu clave API no tiene permisos. ¿Aceptaste los términos en Google AI Studio?"
-        if "404" in error_msg:
-            return "❌ Error 404: Google sigue diciendo que el modelo no existe. Intenta crear una CLAVE NUEVA."
-            
-        return f"❌ Error técnico: {error_msg}"
+        # Si el error es de cuota (demasiados mensajes)
+        if "429" in error_msg:
+            return "🚀 ¡Calma! Mandaste demasiados mensajes seguidos. Esperá un minuto."
+        
+        # Si el error es de la región (aunque estés en USA, a veces falla)
+        if "location" in error_msg.lower():
+            return "📍 Error de ubicación. Revisá que Railway esté en US-East-1."
+
+        return f"🤯 Explotó algo internamente: {error_msg}"
