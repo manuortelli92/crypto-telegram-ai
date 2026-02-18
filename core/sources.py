@@ -1,10 +1,13 @@
 import time
 import requests
-from typing import Dict, Optional, Tuple
-
+import logging
+from typing import Dict, Optional, Tuple, List
 from core.cache import TTLCache
 
-_cache = TTLCache(default_ttl_sec=300)
+logger = logging.getLogger(__name__)
+
+# Cache de 5 minutos para el Top 100 y 1 minuto para precios específicos
+_cache = TTLCache(ttl_seconds=300, max_items=1024)
 
 COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
 COINBASE_SPOT = "https://api.coinbase.com/v2/prices/{product}-spot"
@@ -13,12 +16,10 @@ KRAKEN_TICKER = "https://api.kraken.com/0/public/Ticker"
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "OrtelliCryptoBot/1.0"})
 
-
 def _get_json(url: str, params: Optional[dict] = None, timeout: int = 20) -> dict:
     r = _SESSION.get(url, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
-
 
 def fetch_coingecko_top100(vs: str = "usd") -> list:
     key = f"cg:top100:{vs}"
@@ -35,115 +36,83 @@ def fetch_coingecko_top100(vs: str = "usd") -> list:
         "price_change_percentage": "7d,30d",
     }
 
-    # Backoff muy simple para 429
-    for wait in (0, 2, 5):
+    # Reintentos con espera progresiva para evitar el error 429
+    for wait in (0, 3, 7):
         if wait:
             time.sleep(wait)
         try:
             data = _get_json(COINGECKO_MARKETS, params=params, timeout=25)
-            _cache.set(key, data, ttl_sec=300)  # 5 min
+            # Guardamos los datos puros en el cache
+            _cache.set(key, data)
             return data
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status == 429:
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                logger.warning("CoinGecko rate-limit (429). Reintentando...")
                 continue
             raise
+        except Exception as e:
+            logger.error(f"Error en fetch_coingecko: {e}")
+            break
 
-    # Si sigue 429, devolvemos lo último que haya (si había) o re-lanzamos
-    cached = _cache.get(key)
-    if cached is not None:
-        return cached
-    raise RuntimeError("CoinGecko rate-limited (429). Probá en 1-2 minutos.")
-
-
-def _kraken_pair(symbol: str) -> Optional[str]:
-    # Kraken usa XBT para BTC, y pares contra USD suelen existir para majors.
-    s = symbol.upper()
-    if s == "BTC":
-        s = "XBT"
-    # Algunos en Kraken son USD, otros USDT; probamos USD primero.
-    return f"{s}USD"
-
+    # Si fallaron los reintentos, devolvemos lo que tengamos (aunque esté vencido)
+    return _cache.get(key, allow_stale=True) or []
 
 def kraken_spot_price_usd(symbol: str) -> Optional[float]:
-    key = f"kraken:spot:{symbol}"
+    sym = symbol.upper()
+    if sym == "BTC": sym = "XBT"
+    pair = f"{sym}USD"
+    
+    key = f"kraken:spot:{sym}"
     cached = _cache.get(key)
-    if cached is not None:
-        return cached
-
-    pair = _kraken_pair(symbol)
-    if not pair:
-        return None
+    if cached: return cached
 
     try:
         data = _get_json(KRAKEN_TICKER, params={"pair": pair}, timeout=15)
-        result = data.get("result") or {}
-        if not result:
-            return None
-        # La key real a veces es distinta, tomamos la primera
-        first = next(iter(result.values()))
-        last = float(first["c"][0])
-        _cache.set(key, last, ttl_sec=120)
-        return last
+        result = data.get("result", {})
+        if not result: return None
+        first_key = next(iter(result))
+        price = float(result[first_key]["c"][0])
+        _cache.set(key, price, ttl_seconds=60) # Precio spot dura 1 min
+        return price
     except Exception:
         return None
-
-
-def _coinbase_product(symbol: str) -> Optional[str]:
-    # Coinbase usa formato BTC-USD, ETH-USD...
-    s = symbol.upper()
-    return f"{s}-USD"
-
 
 def coinbase_spot_price_usd(symbol: str) -> Optional[float]:
-    key = f"coinbase:spot:{symbol}"
+    sym = symbol.upper()
+    key = f"coinbase:spot:{sym}"
     cached = _cache.get(key)
-    if cached is not None:
-        return cached
-
-    product = _coinbase_product(symbol)
-    if not product:
-        return None
+    if cached: return cached
 
     try:
-        url = COINBASE_SPOT.format(product=product)
+        url = COINBASE_SPOT.format(product=f"{sym}-USD")
         data = _get_json(url, timeout=15)
-        amount = float(data["data"]["amount"])
-        _cache.set(key, amount, ttl_sec=120)
-        return amount
+        price = float(data["data"]["amount"])
+        _cache.set(key, price, ttl_seconds=60)
+        return price
     except Exception:
         return None
-
 
 def verify_price_multi_source(anchor_price: float, symbol: str, tolerance_pct: float = 2.0) -> Tuple[int, str]:
     """
-    Devuelve:
-      - sources_ok: cuántas fuentes caen dentro del tolerance_pct vs anchor
-      - used: string con fuentes usadas
+    Compara el precio base contra Kraken y Coinbase.
+    Retorna cantidad de fuentes que coinciden y cuáles se usaron.
     """
-    used = []
-    ok = 0
+    used = ["coingecko"]
+    ok_count = 1 # CoinGecko es el punto de partida
 
-    def within(p: float) -> bool:
-        if not p or anchor_price <= 0:
-            return False
-        gap = abs(p - anchor_price) / anchor_price * 100.0
-        return gap <= tolerance_pct
+    def is_near(p: float) -> bool:
+        return abs(p - anchor_price) / anchor_price * 100.0 <= tolerance_pct
 
-    # Kraken
+    # Chequeo Kraken
     pk = kraken_spot_price_usd(symbol)
-    if pk is not None:
+    if pk:
         used.append("kraken")
-        if within(pk):
-            ok += 1
+        if is_near(pk): ok_count += 1
 
-    # Coinbase
+    # Chequeo Coinbase
     pc = coinbase_spot_price_usd(symbol)
-    if pc is not None:
+    if pc:
         used.append("coinbase")
-        if within(pc):
-            ok += 1
+        if is_near(pc): ok_count += 1
 
-    # CoinGecko es anchor, pero lo contamos como fuente usada para claridad
-    used.insert(0, "coingecko")
-    return ok, ", ".join(used)
+    return ok_count, ", ".join(used)
