@@ -8,65 +8,36 @@ logger = logging.getLogger(__name__)
 def gemini_render(system_prompt: str, user_prompt: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return "❌ Error: Configura GEMINI_API_KEY en Railway."
+        return "Falta la clave API."
 
     try:
         genai.configure(api_key=api_key)
         
-        # --- LISTAR MODELOS DISPONIBLES (Para depuración) ---
-        # Esto nos dirá en los logs de Railway qué modelos ve tu bot
-        try:
-            available_models = [m.name for m in genai.list_models()]
-            logger.info(f"Modelos detectados: {available_models}")
-        except Exception as e:
-            logger.warning(f"No se pudieron listar modelos: {e}")
+        # Probamos con el nombre de modelo más específico y actualizado
+        # 'gemini-1.5-flash-latest' suele evitar el error 404 en Railway
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash-latest', 
+            system_instruction=system_prompt
+        )
 
-        # --- SELECCIÓN INTELIGENTE DEL MODELO ---
-        # Intentamos en este orden de preferencia:
-        modelos_a_probar = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
-        
-        selected_model = 'gemini-pro' # Por defecto
-        for m in modelos_a_probar:
-            # Buscamos si el modelo está en la lista de Google (o lo intentamos directamente)
-            selected_model = m
-            break
-
-        logger.info(f"Usando modelo: {selected_model}")
-        
-        # Configurar el modelo seleccionado
-        # Nota: Solo los modelos 1.5 soportan 'system_instruction'
-        if '1.5' in selected_model:
-            model = genai.GenerativeModel(
-                model_name=selected_model,
-                system_instruction=system_prompt
-            )
-            prompt = user_prompt
-        else:
-            # Para gemini-pro (viejo), unimos los prompts
-            model = genai.GenerativeModel(model_name=selected_model)
-            prompt = f"{system_prompt}\n\nUsuario: {user_prompt}"
-
-        # Ajustes de seguridad
-        safety = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ]
-
-        response = model.generate_content(prompt, safety_settings=safety)
+        response = model.generate_content(user_prompt)
         
         if response and response.text:
             return response.text
-        return "El modelo respondió vacío."
+        return "El modelo no generó texto."
 
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Error crítico: {error_msg}")
+        logger.error(f"Error: {error_msg}")
         
-        if "404" in error_msg:
-            return "Error 404: El modelo no se encuentra. Cambia la región de Railway a USA."
-        if "location" in error_msg.lower():
-            return "Error de Región: Google bloquea tu IP actual. Cambia la región en Railway Settings a US-East-1."
-            
-        return f"Error técnico: {error_msg}"
+        # SI VUELVE A DAR 404, PROBAMOS EL MODELO PRO QUE SIEMPRE ESTÁ DISPONIBLE
+        if "404" in error_msg or "not found" in error_msg.lower():
+            try:
+                logger.info("Intentando con gemini-pro (fallback)...")
+                model_alt = genai.GenerativeModel('gemini-pro')
+                res = model_alt.generate_content(f"{system_prompt}\n\n{user_prompt}")
+                return res.text
+            except:
+                return "Error 404 persistente: Google no reconoce el modelo en esta cuenta."
+        
+        return f"Error: {error_msg}"
